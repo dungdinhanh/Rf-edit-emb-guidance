@@ -28,6 +28,7 @@ class Inference(object):
         pipeline=None,
         use_cpu_offload=False,
         device=None,
+        vae_device=None,
         logger=None,
     ):
         self.vae = vae
@@ -48,6 +49,7 @@ class Inference(object):
             if torch.cuda.is_available()
             else "cpu"
         )
+        self.vae_device = vae_device if vae_device is not None else self.device
         self.logger = logger
 
     @classmethod
@@ -70,9 +72,23 @@ class Inference(object):
             device = "cuda" if torch.cuda.is_available() else "cpu"
         torch.set_grad_enabled(False)
 
+        # Determine device placement
+        multi_gpu = getattr(args, 'multi_gpu', False)
+        if multi_gpu:
+            gpu_ids = args.gpu_ids
+            device = f"cuda:{gpu_ids[0]}"
+            vae_device = f"cuda:{gpu_ids[1]}"
+            logger.info(f"Multi-GPU: sharding transformer across {device} and {vae_device}, "
+                        f"VAE+text encoders on {vae_device}")
+        elif args.use_cpu_offload:
+            vae_device = "cpu"
+        else:
+            vae_device = device
+
         # =========================== Build main model ===========================
-        logger.info("Building model...")
-        factor_kwargs = {"device": device, "dtype": PRECISION_TO_TYPE[args.precision]}
+        # Build and load weights on CPU first, then shard/move to target device(s).
+        logger.info(f"Building model on cpu...")
+        factor_kwargs = {"device": "cpu", "dtype": PRECISION_TO_TYPE[args.precision]}
         in_channels = args.latent_channels
         out_channels = args.latent_channels
 
@@ -82,8 +98,14 @@ class Inference(object):
             out_channels=out_channels,
             factor_kwargs=factor_kwargs,
         )
-        model = model.to(device)
         model = Inference.load_state_dict(args, model, pretrained_model_path)
+
+        if multi_gpu:
+            model.shard_to_devices(device, vae_device)
+            logger.info(f"Transformer sharded: double blocks split at {model._double_split}, "
+                        f"single blocks split at {model._single_split}")
+        else:
+            model = model.to(device)
         model.eval()
 
         # ============================= Build extra models ========================
@@ -92,7 +114,7 @@ class Inference(object):
             args.vae,
             args.vae_precision,
             logger=logger,
-            device=device if not args.use_cpu_offload else "cpu",
+            device=vae_device,
         )
         vae_kwargs = {"s_ratio": s_ratio, "t_ratio": t_ratio}
 
@@ -121,10 +143,16 @@ class Inference(object):
             else None
         )
 
+        # In multi-GPU sharded mode, load text encoders on CPU (fp32) to save GPU memory.
+        # CPU doesn't support fp16 matmul. They're only used once for prompt encoding.
+        text_enc_device = "cpu" if multi_gpu else vae_device
+        text_enc_precision = "fp32" if multi_gpu else args.text_encoder_precision
+        text_enc_precision_2 = "fp32" if multi_gpu else args.text_encoder_precision_2
+
         text_encoder = TextEncoder(
             text_encoder_type=args.text_encoder,
             max_length=max_length,
-            text_encoder_precision=args.text_encoder_precision,
+            text_encoder_precision=text_enc_precision,
             tokenizer_type=args.tokenizer,
             prompt_template=prompt_template,
             prompt_template_video=prompt_template_video,
@@ -132,18 +160,18 @@ class Inference(object):
             apply_final_norm=args.apply_final_norm,
             reproduce=args.reproduce,
             logger=logger,
-            device=device if not args.use_cpu_offload else "cpu",
+            device=text_enc_device,
         )
         text_encoder_2 = None
         if args.text_encoder_2 is not None:
             text_encoder_2 = TextEncoder(
                 text_encoder_type=args.text_encoder_2,
                 max_length=args.text_len_2,
-                text_encoder_precision=args.text_encoder_precision_2,
+                text_encoder_precision=text_enc_precision_2,
                 tokenizer_type=args.tokenizer_2,
                 reproduce=args.reproduce,
                 logger=logger,
-                device=device if not args.use_cpu_offload else "cpu",
+                device=text_enc_device,
             )
 
         return cls(
@@ -155,6 +183,7 @@ class Inference(object):
             model=model,
             use_cpu_offload=args.use_cpu_offload,
             device=device,
+            vae_device=vae_device,
             logger=logger,
         )
 
@@ -232,6 +261,7 @@ class Inference(object):
                     f"Missing key: `{load_key}` in the checkpoint: {model_path}. The keys in the checkpoint "
                     f"are: {list(state_dict.keys())}."
                 )
+
         model.load_state_dict(state_dict, strict=True)
         return model
 
@@ -260,6 +290,7 @@ class HunyuanVideoEdit(Inference):
         pipeline=None,
         use_cpu_offload=False,
         device=0,
+        vae_device=None,
         logger=None,
     ):
         super().__init__(
@@ -272,6 +303,7 @@ class HunyuanVideoEdit(Inference):
             pipeline=pipeline,
             use_cpu_offload=use_cpu_offload,
             device=device,
+            vae_device=vae_device,
             logger=logger,
         )
 
@@ -318,7 +350,11 @@ class HunyuanVideoEdit(Inference):
             progress_bar_config=progress_bar_config,
             args=args,
         )
-        if self.use_cpu_offload:
+        if getattr(self.args, 'multi_gpu', False):
+            # Components are already on their respective GPUs
+            pipeline._multi_gpu = True
+            pipeline._vae_device = torch.device(self.vae_device)
+        elif self.use_cpu_offload:
             pipeline.enable_sequential_cpu_offload()
         else:
             pipeline = pipeline.to(device)
@@ -556,10 +592,13 @@ class HunyuanVideoEdit(Inference):
         # Pipeline inference
         # ========================================================================
         start_time = time.time()
+        multi_gpu = getattr(self.args, 'multi_gpu', False)
 
         if self.args.vae_tiling:
             self.pipeline.vae.enable_tiling()
-        latents = self.pipeline.vae.encode(source_video).latent_dist.sample()
+        # Move source video to VAE device for encoding
+        vae_input = source_video.to(self.vae_device) if multi_gpu else source_video
+        latents = self.pipeline.vae.encode(vae_input).latent_dist.sample()
         if (
                 hasattr(self.pipeline.vae.config, "shift_factor")
                 and self.pipeline.vae.config.shift_factor
@@ -569,6 +608,9 @@ class HunyuanVideoEdit(Inference):
                 )
         else:
             latents = latents * self.pipeline.vae.config.scaling_factor
+        # Move latents to transformer device for denoising
+        if multi_gpu:
+            latents = latents.to(self.device)
 
         info = {'feature':{}}
         noise, info = self.pipeline(

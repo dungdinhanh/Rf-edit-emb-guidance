@@ -1,0 +1,33 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+
+# Model checkpoints and weights
+ckpts/
+*.pt
+*.pth
+*.safetensors
+*.bin
+*.onnx
+
+# Generated outputs
+*.mp4
+*.avi
+*.mov
+sampled_videos/
+results*/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Jupyter
+.ipynb_checkpoints/
+
+# OS
+.DS_Store
+Thumbs.db

@@ -1,13 +1,13 @@
 #!/bin/bash
+cd "$(dirname "$0")/.."
 
-
-python3 sample_video.py   \
+python3 edit_video.py   \
         --target_prompt 'A panda wearing a Crown walking in the snow'  \
         --infer-steps 25   \
         --source_prompt 'A panda walking in the snow'  \
         --flow-reverse  \
-        --use-cpu-offload   \
+        --multi-gpu --gpu-ids 0 1   \
         --save-path ./panda \
-        --source_path './panda.mp4' \
+        --source_path './scripts/panda.mp4' \
         --inject_step 3 \
-        --embedded-cfg-scale 7 
+        --embedded-cfg-scale 7

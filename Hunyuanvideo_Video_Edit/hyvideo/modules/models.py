@@ -351,7 +351,7 @@ class MMSingleStreamBlock(nn.Module):
         else:
             if info['inject'] and info['block_id'] > 20:
                 name = str(info['timestep']) + '-' + str(info['second_order']) + '-' + str(info['block_id'])
-                v = info['feature'][name].cuda()
+                v = info['feature'][name].to(v.device)
 
         assert (
             cu_seqlens_q.shape[0] == 2 * x.shape[0] + 1
@@ -559,6 +559,38 @@ class HYVideoDiffusionTransformer(ModelMixin, ConfigMixin):
             **factory_kwargs,
         )
 
+    def shard_to_devices(self, device0, device1):
+        """Shard transformer layers across two GPUs.
+
+        GPU 0 (device0): embeddings + first half of blocks
+        GPU 1 (device1): second half of blocks + final layer + VAE
+        """
+        self._shard_device0 = device0
+        self._shard_device1 = device1
+        self._double_split = len(self.double_blocks) // 2
+        self._single_split = len(self.single_blocks) // 2
+
+        # GPU 0: embeddings + first half of blocks
+        self.img_in.to(device0)
+        self.txt_in.to(device0)
+        self.time_in.to(device0)
+        self.vector_in.to(device0)
+        if self.guidance_in is not None:
+            self.guidance_in.to(device0)
+
+        for i, block in enumerate(self.double_blocks):
+            block.to(device0 if i < self._double_split else device1)
+
+        for i, block in enumerate(self.single_blocks):
+            block.to(device0 if i < self._single_split else device1)
+
+        # GPU 1: final layer
+        self.final_layer.to(device1)
+
+    @property
+    def is_sharded(self):
+        return hasattr(self, '_shard_device0')
+
     def enable_deterministic(self):
         for block in self.double_blocks:
             block.enable_deterministic()
@@ -632,7 +664,20 @@ class HYVideoDiffusionTransformer(ModelMixin, ConfigMixin):
 
         freqs_cis = (freqs_cos, freqs_sin) if freqs_cos is not None else None
         # --------------------- Pass through DiT blocks ------------------------
-        for _, block in enumerate(self.double_blocks):
+        for i, block in enumerate(self.double_blocks):
+            # Transfer activations to device1 at the split point
+            if self.is_sharded and i == self._double_split:
+                dev1 = self._shard_device1
+                img = img.to(dev1)
+                txt = txt.to(dev1)
+                vec = vec.to(dev1)
+                cu_seqlens_q = cu_seqlens_q.to(dev1)
+                cu_seqlens_kv = cu_seqlens_kv.to(dev1)
+                if freqs_cis is not None:
+                    freqs_cis = (freqs_cis[0].to(dev1), freqs_cis[1].to(dev1))
+                    freqs_cos = freqs_cis[0]
+                    freqs_sin = freqs_cis[1]
+
             double_block_args = [
                 img,
                 txt,
@@ -648,8 +693,30 @@ class HYVideoDiffusionTransformer(ModelMixin, ConfigMixin):
 
         # Merge txt and img to pass through single stream blocks.
         x = torch.cat((img, txt), 1)
+
+        # If sharded and single blocks start on device0, transfer back
+        if self.is_sharded and self._single_split > 0 and x.device != self.single_blocks[0].linear1.weight.device:
+            target_dev = self.single_blocks[0].linear1.weight.device
+            x = x.to(target_dev)
+            vec = vec.to(target_dev)
+            cu_seqlens_q = cu_seqlens_q.to(target_dev)
+            cu_seqlens_kv = cu_seqlens_kv.to(target_dev)
+            freqs_cos = freqs_cos.to(target_dev)
+            freqs_sin = freqs_sin.to(target_dev)
+
         if len(self.single_blocks) > 0:
             for cnt, block in enumerate(self.single_blocks):
+                # Transfer activations to device1 at the single block split point
+                if self.is_sharded and cnt == self._single_split:
+                    dev1 = self._shard_device1
+                    if x.device != dev1:
+                        x = x.to(dev1)
+                        vec = vec.to(dev1)
+                        cu_seqlens_q = cu_seqlens_q.to(dev1)
+                        cu_seqlens_kv = cu_seqlens_kv.to(dev1)
+                        freqs_cos = freqs_cos.to(dev1)
+                        freqs_sin = freqs_sin.to(dev1)
+
                 info['block_id'] = cnt
                 single_block_args = [
                     x,

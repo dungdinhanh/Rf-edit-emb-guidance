@@ -286,6 +286,10 @@ class HunyuanVideoPipeline(DiffusionPipeline):
         if text_encoder is None:
             text_encoder = self.text_encoder
 
+        # Determine encoding device: use the text encoder's own device
+        # (may be CPU in sharded multi-GPU mode), outputs are moved to target device below
+        enc_device = next(text_encoder.model.parameters()).device if hasattr(text_encoder, 'model') else device
+
         # set lora scale so that monkey patched LoRA
         # function of text encoder can correctly access it
         if lora_scale is not None and isinstance(self, LoraLoaderMixin):
@@ -313,7 +317,7 @@ class HunyuanVideoPipeline(DiffusionPipeline):
 
             if clip_skip is None:
                 prompt_outputs = text_encoder.encode(
-                    text_inputs, data_type=data_type, device=device
+                    text_inputs, data_type=data_type, device=enc_device
                 )
                 prompt_embeds = prompt_outputs.hidden_state
             else:
@@ -321,7 +325,7 @@ class HunyuanVideoPipeline(DiffusionPipeline):
                     text_inputs,
                     output_hidden_states=True,
                     data_type=data_type,
-                    device=device,
+                    device=enc_device,
                 )
                 # Access the `hidden_states` first, that contains a tuple of
                 # all the hidden states from the encoder layers. Then index into
@@ -397,7 +401,7 @@ class HunyuanVideoPipeline(DiffusionPipeline):
             uncond_input = text_encoder.text2tokens(uncond_tokens, data_type=data_type)
 
             negative_prompt_outputs = text_encoder.encode(
-                uncond_input, data_type=data_type, device=device
+                uncond_input, data_type=data_type, device=enc_device
             )
             negative_prompt_embeds = negative_prompt_outputs.hidden_state
 
@@ -839,6 +843,12 @@ class HunyuanVideoPipeline(DiffusionPipeline):
             batch_size = prompt_embeds.shape[0]
 
         device = self._execution_device
+        # In multi-GPU mode, use transformer's first device for inputs
+        if hasattr(self, '_multi_gpu') and self._multi_gpu:
+            if self.transformer.is_sharded:
+                device = self.transformer._shard_device0
+            else:
+                device = next(self.transformer.parameters()).device
 
         # 3. Encode input prompt
         lora_scale = (
@@ -1017,7 +1027,10 @@ class HunyuanVideoPipeline(DiffusionPipeline):
                         return_dict=True,
                     )
                     noise_pred = noise_pred["x"]#bfloat16
-                    
+                    # Move output back to input device if sharded
+                    if noise_pred.device != device:
+                        noise_pred = noise_pred.to(device)
+
                 # perform guidance
                 if self.do_classifier_free_guidance:
                     noise_pred_uncond, noise_pred_text = noise_pred.chunk(2)
@@ -1064,7 +1077,9 @@ class HunyuanVideoPipeline(DiffusionPipeline):
                             info=info
                         )
                     noise_pred_mid = noise_pred_mid["x"]
-                # import pdb;pdb.set_trace()
+                    # Move output back to input device if sharded
+                    if noise_pred_mid.device != device:
+                        noise_pred_mid = noise_pred_mid.to(device)
                 # 3. step forward 
                 latents = self.scheduler.step_solver(
                     noise_pred_mid, noise_pred, t, latents, **extra_step_kwargs, return_dict=False
@@ -1094,8 +1109,12 @@ class HunyuanVideoPipeline(DiffusionPipeline):
                         callback(step_idx, t, latents)
         
         if not output_type == "latent":
+            _multi_gpu = hasattr(self, '_multi_gpu') and self._multi_gpu
+            # Free transformer GPU memory before VAE decode
             self.transformer = self.transformer.cpu()
             torch.cuda.empty_cache()
+            if _multi_gpu:
+                latents = latents.to(self._vae_device)
             expand_temporal_dim = False
             if len(latents.shape) == 4:
                 if isinstance(self.vae, AutoencoderKLCausal3D):

@@ -253,6 +253,19 @@ def add_inference_args(parser: argparse.ArgumentParser):
         action="store_true",
         help="Use CPU offload for the model load.",
     )
+    group.add_argument(
+        "--multi-gpu",
+        action="store_true",
+        help="Distribute model across multiple GPUs. Transformer goes to first GPU, "
+             "VAE + text encoders go to second GPU.",
+    )
+    group.add_argument(
+        "--gpu-ids",
+        type=int,
+        nargs="+",
+        default=[0, 1],
+        help="GPU IDs for multi-GPU mode. First: transformer, second: VAE+text encoders.",
+    )
 
     # ======================== Inference general setting ========================
     group.add_argument(
@@ -368,6 +381,19 @@ def add_inference_args(parser: argparse.ArgumentParser):
 
 
 def sanity_check_args(args):
+    # Multi-GPU and CPU offload are mutually exclusive
+    if getattr(args, 'multi_gpu', False) and args.use_cpu_offload:
+        print("WARNING: --multi-gpu and --use-cpu-offload are mutually exclusive. Using --multi-gpu.")
+        args.use_cpu_offload = False
+    if getattr(args, 'multi_gpu', False):
+        import torch
+        gpu_ids = args.gpu_ids
+        if len(gpu_ids) < 2:
+            raise ValueError("--multi-gpu requires at least 2 GPU IDs via --gpu-ids")
+        for gid in gpu_ids:
+            if gid >= torch.cuda.device_count():
+                raise ValueError(f"GPU {gid} not available. Found {torch.cuda.device_count()} GPUs.")
+
     # VAE channels
     vae_pattern = r"\d{2,3}-\d{1,2}c-\w+"
     if not re.match(vae_pattern, args.vae):
