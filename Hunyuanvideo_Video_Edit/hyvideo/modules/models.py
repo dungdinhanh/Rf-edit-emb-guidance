@@ -138,6 +138,7 @@ class MMDoubleStreamBlock(nn.Module):
         max_seqlen_q: Optional[int] = None,
         max_seqlen_kv: Optional[int] = None,
         freqs_cis: tuple = None,
+        attn_kv_hook=None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         (
             img_mod1_shift,
@@ -194,6 +195,10 @@ class MMDoubleStreamBlock(nn.Module):
         q = torch.cat((img_q, txt_q), dim=1)
         k = torch.cat((img_k, txt_k), dim=1)
         v = torch.cat((img_v, txt_v), dim=1)
+
+        if attn_kv_hook is not None:
+            q, k, v = attn_kv_hook(q, k, v, img_len=img.shape[1], txt_len=txt.shape[1])
+
         assert (
             cu_seqlens_q.shape[0] == 2 * img.shape[0] + 1
         ), f"cu_seqlens_q.shape:{cu_seqlens_q.shape}, img.shape[0]:{img.shape[0]}"
@@ -316,6 +321,7 @@ class MMSingleStreamBlock(nn.Module):
         max_seqlen_kv: Optional[int] = None,
         freqs_cis: Tuple[torch.Tensor, torch.Tensor] = None,
         info = {},
+        attn_kv_hook=None,
     ) -> torch.Tensor:
 
         mod_shift, mod_scale, mod_gate = self.modulation(vec).chunk(3, dim=-1)
@@ -352,6 +358,10 @@ class MMSingleStreamBlock(nn.Module):
             if info['inject'] and info['block_id'] > 20:
                 name = str(info['timestep']) + '-' + str(info['second_order']) + '-' + str(info['block_id'])
                 v = info['feature'][name].to(v.device)
+
+        if attn_kv_hook is not None:
+            img_len = x.shape[1] - txt_len
+            q, k, v = attn_kv_hook(q, k, v, img_len=img_len, txt_len=txt_len)
 
         assert (
             cu_seqlens_q.shape[0] == 2 * x.shape[0] + 1
@@ -615,6 +625,7 @@ class HYVideoDiffusionTransformer(ModelMixin, ConfigMixin):
         guidance: torch.Tensor = None,  # Guidance for modulation, should be cfg_scale x 1000.
         return_dict: bool = True,
         info = {},
+        attn_guidance_config: Optional[Dict] = None,
     ) -> Union[torch.Tensor, Dict[str, torch.Tensor]]:
         out = {}
         img = x
@@ -663,6 +674,34 @@ class HYVideoDiffusionTransformer(ModelMixin, ConfigMixin):
         max_seqlen_kv = max_seqlen_q
 
         freqs_cis = (freqs_cos, freqs_sin) if freqs_cos is not None else None
+
+        # Prepare attention-level guidance if enabled
+        _attn_guid = None
+        if attn_guidance_config is not None:
+            from .attn_guidance import make_double_block_hook, make_single_block_hook
+            uncond_txt_raw = attn_guidance_config['uncond_text_states']
+            uncond_text_states_2 = attn_guidance_config['uncond_text_states_2']
+            uncond_mask = attn_guidance_config.get('uncond_text_mask', text_mask)
+            _gk = attn_guidance_config['k']
+            _ga = attn_guidance_config['alpha']
+            _gt = attn_guidance_config.get('overlap_target', 'uncond')
+
+            # Compute uncond modulation vector
+            uncond_vec = self.time_in(t) + self.vector_in(uncond_text_states_2)
+            if self.guidance_embed and guidance is not None:
+                uncond_vec = uncond_vec + self.guidance_in(guidance)
+
+            # Project uncond text embeddings
+            if self.text_projection == "linear":
+                uncond_txt = self.txt_in(uncond_txt_raw)
+            elif self.text_projection == "single_refiner":
+                uncond_txt = self.txt_in(uncond_txt_raw, t, uncond_mask if self.use_attention_mask else None)
+
+            _attn_guid = {
+                'uncond_txt': uncond_txt, 'uncond_vec': uncond_vec,
+                'cond_vec': vec, 'k': _gk, 'alpha': _ga, 'overlap_target': _gt,
+            }
+
         # --------------------- Pass through DiT blocks ------------------------
         for i, block in enumerate(self.double_blocks):
             # Transfer activations to device1 at the split point
@@ -677,19 +716,27 @@ class HYVideoDiffusionTransformer(ModelMixin, ConfigMixin):
                     freqs_cis = (freqs_cis[0].to(dev1), freqs_cis[1].to(dev1))
                     freqs_cos = freqs_cis[0]
                     freqs_sin = freqs_cis[1]
+                if _attn_guid is not None:
+                    _attn_guid['uncond_txt'] = _attn_guid['uncond_txt'].to(dev1)
+                    _attn_guid['uncond_vec'] = _attn_guid['uncond_vec'].to(dev1)
+                    _attn_guid['cond_vec'] = _attn_guid['cond_vec'].to(dev1)
+
+            # Build attention guidance hook for this block if enabled
+            db_hook = None
+            if _attn_guid is not None:
+                db_hook = make_double_block_hook(
+                    block, txt, _attn_guid['uncond_txt'],
+                    _attn_guid['cond_vec'], _attn_guid['uncond_vec'],
+                    _attn_guid['k'], _attn_guid['alpha'], _attn_guid['overlap_target'],
+                )
 
             double_block_args = [
-                img,
-                txt,
-                vec,
-                cu_seqlens_q,
-                cu_seqlens_kv,
-                max_seqlen_q,
-                max_seqlen_kv,
+                img, txt, vec,
+                cu_seqlens_q, cu_seqlens_kv, max_seqlen_q, max_seqlen_kv,
                 freqs_cis,
             ]
 
-            img, txt = block(*double_block_args)
+            img, txt = block(*double_block_args, attn_kv_hook=db_hook)
 
         # Merge txt and img to pass through single stream blocks.
         x = torch.cat((img, txt), 1)
@@ -703,6 +750,10 @@ class HYVideoDiffusionTransformer(ModelMixin, ConfigMixin):
             cu_seqlens_kv = cu_seqlens_kv.to(target_dev)
             freqs_cos = freqs_cos.to(target_dev)
             freqs_sin = freqs_sin.to(target_dev)
+            if _attn_guid is not None:
+                _attn_guid['uncond_txt'] = _attn_guid['uncond_txt'].to(target_dev)
+                _attn_guid['uncond_vec'] = _attn_guid['uncond_vec'].to(target_dev)
+                _attn_guid['cond_vec'] = _attn_guid['cond_vec'].to(target_dev)
 
         if len(self.single_blocks) > 0:
             for cnt, block in enumerate(self.single_blocks):
@@ -716,21 +767,28 @@ class HYVideoDiffusionTransformer(ModelMixin, ConfigMixin):
                         cu_seqlens_kv = cu_seqlens_kv.to(dev1)
                         freqs_cos = freqs_cos.to(dev1)
                         freqs_sin = freqs_sin.to(dev1)
+                        if _attn_guid is not None:
+                            _attn_guid['uncond_txt'] = _attn_guid['uncond_txt'].to(dev1)
+                            _attn_guid['uncond_vec'] = _attn_guid['uncond_vec'].to(dev1)
+                            _attn_guid['cond_vec'] = _attn_guid['cond_vec'].to(dev1)
+
+                # Build attention guidance hook for single block
+                sb_hook = None
+                if _attn_guid is not None:
+                    sb_hook = make_single_block_hook(
+                        block, _attn_guid['uncond_txt'],
+                        _attn_guid['cond_vec'], _attn_guid['uncond_vec'],
+                        _attn_guid['k'], _attn_guid['alpha'], _attn_guid['overlap_target'],
+                    )
 
                 info['block_id'] = cnt
                 single_block_args = [
-                    x,
-                    vec,
-                    txt_seq_len,
-                    cu_seqlens_q,
-                    cu_seqlens_kv,
-                    max_seqlen_q,
-                    max_seqlen_kv,
-                    (freqs_cos, freqs_sin),
-                    info,
+                    x, vec, txt_seq_len,
+                    cu_seqlens_q, cu_seqlens_kv, max_seqlen_q, max_seqlen_kv,
+                    (freqs_cos, freqs_sin), info,
                 ]
 
-                x, info = block(*single_block_args)
+                x, info = block(*single_block_args, attn_kv_hook=sb_hook)
 
         img = x[:, :img_seq_len, ...]
 

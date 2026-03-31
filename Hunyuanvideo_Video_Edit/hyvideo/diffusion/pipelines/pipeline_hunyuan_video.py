@@ -903,17 +903,19 @@ class HunyuanVideoPipeline(DiffusionPipeline):
             prompt_mask_2 = None
             negative_prompt_mask_2 = None
 
-        # For classifier free guidance, we need to do two forward passes.
-        # Here we concatenate the unconditional and text embeddings into a single batch
-        # to avoid doing two forward passes
+        # For CFG, keep cond and uncond embeddings separate for sequential forward passes
+        # (avoids OOM from batch=2 on memory-constrained GPUs)
+        prompt_embeds_cond = prompt_embeds
+        prompt_mask_cond = prompt_mask
+        prompt_embeds_2_cond = prompt_embeds_2
         if self.do_classifier_free_guidance:
-            prompt_embeds = torch.cat([negative_prompt_embeds, prompt_embeds])
-            if prompt_mask is not None:
-                prompt_mask = torch.cat([negative_prompt_mask, prompt_mask])
-            if prompt_embeds_2 is not None:
-                prompt_embeds_2 = torch.cat([negative_prompt_embeds_2, prompt_embeds_2])
-            if prompt_mask_2 is not None:
-                prompt_mask_2 = torch.cat([negative_prompt_mask_2, prompt_mask_2])
+            prompt_embeds_uncond = negative_prompt_embeds
+            prompt_mask_uncond = negative_prompt_mask
+            prompt_embeds_2_uncond = negative_prompt_embeds_2
+        else:
+            prompt_embeds_uncond = None
+            prompt_mask_uncond = None
+            prompt_embeds_2_uncond = None
 
 
         # 4. Prepare timesteps
@@ -985,18 +987,9 @@ class HunyuanVideoPipeline(DiffusionPipeline):
                 
                 info['timestep'] = t.item() if not inversion else timesteps[i+1].item()
                 info['inject'] = inject_list[i]
-                # expand the latents if we are doing classifier free guidance
-                latent_model_input = (
-                    torch.cat([latents] * 2)
-                    if self.do_classifier_free_guidance
-                    else latents
-                )
-                latent_model_input = self.scheduler.scale_model_input(
-                    latent_model_input, t
-                )
-
+                latent_model_input = self.scheduler.scale_model_input(latents, t)
                 t_expand = t.repeat(latent_model_input.shape[0])
-                
+
                 guidance_expand = (
                     torch.tensor(
                         [embedded_guidance_scale] * latent_model_input.shape[0],
@@ -1008,35 +1001,55 @@ class HunyuanVideoPipeline(DiffusionPipeline):
                     else None
                 )
 
-                # predict the noise residual
-                # import pdb;pdb.set_trace()
+                # Sequential CFG: run cond and uncond as separate forward passes
+                # to avoid OOM from batch=2 on memory-constrained GPUs.
                 with torch.autocast(
                     device_type="cuda", dtype=target_dtype, enabled=autocast_enabled
                 ):
                     info['second_order'] = False
-                    noise_pred, info = self.transformer(  # For an input image (129, 192, 336) (1, 256, 256)
-                        latent_model_input,  # [2, 16, 33, 24, 42]
-                        t_expand,  # [2]
+                    # Conditional forward pass
+                    noise_pred_text, info = self.transformer(
+                        latent_model_input,
+                        t_expand,
                         info=info,
-                        text_states=prompt_embeds,  # [2, 256, 4096]
-                        text_mask=prompt_mask,  # [2, 256]
-                        text_states_2=prompt_embeds_2,  # [2, 768]
-                        freqs_cos=freqs_cis[0],  # [seqlen, head_dim]
-                        freqs_sin=freqs_cis[1],  # [seqlen, head_dim]
+                        text_states=prompt_embeds_cond,
+                        text_mask=prompt_mask_cond,
+                        text_states_2=prompt_embeds_2_cond,
+                        freqs_cos=freqs_cis[0],
+                        freqs_sin=freqs_cis[1],
                         guidance=guidance_expand,
                         return_dict=True,
                     )
-                    noise_pred = noise_pred["x"]#bfloat16
-                    # Move output back to input device if sharded
-                    if noise_pred.device != device:
-                        noise_pred = noise_pred.to(device)
+                    noise_pred_text = noise_pred_text["x"]
+                    if noise_pred_text.device != device:
+                        noise_pred_text = noise_pred_text.to(device)
 
-                # perform guidance
                 if self.do_classifier_free_guidance:
-                    noise_pred_uncond, noise_pred_text = noise_pred.chunk(2)
+                    # Unconditional forward pass (separate to save memory)
+                    with torch.autocast(
+                        device_type="cuda", dtype=target_dtype, enabled=autocast_enabled
+                    ):
+                        noise_pred_uncond, _ = self.transformer(
+                            latent_model_input,
+                            t_expand,
+                            info=info,
+                            text_states=prompt_embeds_uncond,
+                            text_mask=prompt_mask_uncond,
+                            text_states_2=prompt_embeds_2_uncond,
+                            freqs_cos=freqs_cis[0],
+                            freqs_sin=freqs_cis[1],
+                            guidance=guidance_expand,
+                            return_dict=True,
+                        )
+                        noise_pred_uncond = noise_pred_uncond["x"]
+                        if noise_pred_uncond.device != device:
+                            noise_pred_uncond = noise_pred_uncond.to(device)
+
                     noise_pred = noise_pred_uncond + self.guidance_scale * (
                         noise_pred_text - noise_pred_uncond
                     )
+                else:
+                    noise_pred = noise_pred_text
 
                 if self.do_classifier_free_guidance and self.guidance_rescale > 0.0:
                     # Based on 3.4. in https://arxiv.org/pdf/2305.08891.pdf
@@ -1058,28 +1071,53 @@ class HunyuanVideoPipeline(DiffusionPipeline):
                 latent_model_input_mid = self.scheduler.scale_model_input(
                     latents_mid, t_mid
                 )
-                t_expand_mid = t_mid.repeat(latent_model_input.shape[0])
-                
+                t_expand_mid = t_mid.repeat(latent_model_input_mid.shape[0])
+
                 with torch.autocast(
                     device_type="cuda", dtype=target_dtype, enabled=autocast_enabled
                 ):
                     info['second_order'] = True
-                    noise_pred_mid, info = self.transformer(  # For an input image (129, 192, 336) (1, 256, 256)
-                            latent_model_input_mid,  # [2, 16, 33, 24, 42]
-                            t_expand_mid,  # [2]
-                            text_states=prompt_embeds,  # [2, 256, 4096]
-                            text_mask=prompt_mask,  # [2, 256]
-                            text_states_2=prompt_embeds_2,  # [2, 768]
-                            freqs_cos=freqs_cis[0],  # [seqlen, head_dim]
-                            freqs_sin=freqs_cis[1],  # [seqlen, head_dim]
+                    noise_pred_mid_text, info = self.transformer(
+                            latent_model_input_mid,
+                            t_expand_mid,
+                            text_states=prompt_embeds_cond,
+                            text_mask=prompt_mask_cond,
+                            text_states_2=prompt_embeds_2_cond,
+                            freqs_cos=freqs_cis[0],
+                            freqs_sin=freqs_cis[1],
                             guidance=guidance_expand,
                             return_dict=True,
                             info=info
                         )
-                    noise_pred_mid = noise_pred_mid["x"]
-                    # Move output back to input device if sharded
-                    if noise_pred_mid.device != device:
-                        noise_pred_mid = noise_pred_mid.to(device)
+                    noise_pred_mid_text = noise_pred_mid_text["x"]
+                    if noise_pred_mid_text.device != device:
+                        noise_pred_mid_text = noise_pred_mid_text.to(device)
+
+                if self.do_classifier_free_guidance:
+                    with torch.autocast(
+                        device_type="cuda", dtype=target_dtype, enabled=autocast_enabled
+                    ):
+                        noise_pred_mid_uncond, _ = self.transformer(
+                                latent_model_input_mid,
+                                t_expand_mid,
+                                text_states=prompt_embeds_uncond,
+                                text_mask=prompt_mask_uncond,
+                                text_states_2=prompt_embeds_2_uncond,
+                                freqs_cos=freqs_cis[0],
+                                freqs_sin=freqs_cis[1],
+                                guidance=guidance_expand,
+                                return_dict=True,
+                                info=info
+                            )
+                        noise_pred_mid_uncond = noise_pred_mid_uncond["x"]
+                        if noise_pred_mid_uncond.device != device:
+                            noise_pred_mid_uncond = noise_pred_mid_uncond.to(device)
+
+                    noise_pred_mid = noise_pred_mid_uncond + self.guidance_scale * (
+                        noise_pred_mid_text - noise_pred_mid_uncond
+                    )
+                else:
+                    noise_pred_mid = noise_pred_mid_text
                 # 3. step forward 
                 latents = self.scheduler.step_solver(
                     noise_pred_mid, noise_pred, t, latents, **extra_step_kwargs, return_dict=False
