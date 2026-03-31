@@ -115,7 +115,7 @@ def fid_eval(args):
 
 
 def video_eval(args):
-    from .video_metrics import compute_video_psnr, compute_video_ssim, compute_video_lpips
+    from .video_metrics import compute_video_psnr, compute_video_ssim, compute_video_lpips, compute_video_clip_score
 
     device = torch.device(args.device)
     results = {}
@@ -131,6 +131,11 @@ def video_eval(args):
     print("  Computing LPIPS...")
     results.update(compute_video_lpips(args.source, args.edited, device=device))
     print(f"    LPIPS: {results['lpips_mean']:.4f} ± {results['lpips_std']:.4f}")
+
+    if hasattr(args, 'target_prompt') and args.target_prompt:
+        print("  Computing CLIP Score...")
+        results.update(compute_video_clip_score(args.edited, args.target_prompt, device=device))
+        print(f"    CLIP: {results['clip_score_mean']:.4f} ± {results['clip_score_std']:.4f}")
 
     if args.output:
         _save_json(results, args.output)
@@ -183,6 +188,7 @@ def main():
     p_vid = sub.add_parser("video", help="Frame-level video metrics (PSNR, SSIM, LPIPS)")
     p_vid.add_argument("--source", required=True, help="Source video")
     p_vid.add_argument("--edited", required=True, help="Edited video")
+    p_vid.add_argument("--target-prompt", default=None, help="Target prompt for CLIP score")
 
     # vbench subcommand
     p_vb = sub.add_parser("vbench", help="VBench video quality metrics")

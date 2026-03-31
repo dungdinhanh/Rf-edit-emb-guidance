@@ -85,6 +85,43 @@ def compute_video_lpips(
 
 
 # ---------------------------------------------------------------------------
+# CLIP Score (text-video alignment)
+# ---------------------------------------------------------------------------
+
+def compute_video_clip_score(
+    edited_video: Union[str, Path],
+    target_prompt: str,
+    device: Optional[torch.device] = None,
+    sample_frames: int = 8,
+) -> Dict[str, float]:
+    """Frame-sampled CLIP score between edited video and target prompt.
+
+    Samples `sample_frames` evenly spaced frames and averages CLIP scores.
+    """
+    from .metrics import compute_clip_score
+
+    if device is None:
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+    frames = _load_video_frames(edited_video)
+    n = len(frames)
+
+    # Sample frames evenly
+    if n <= sample_frames:
+        indices = list(range(n))
+    else:
+        indices = [int(i * n / sample_frames) for i in range(sample_frames)]
+
+    scores = []
+    for idx in indices:
+        frame = frames[idx]  # (C, H, W) float [0, 1]
+        score = compute_clip_score(frame, target_prompt, device=device)
+        scores.append(score)
+
+    return {"clip_score_mean": float(np.mean(scores)), "clip_score_std": float(np.std(scores))}
+
+
+# ---------------------------------------------------------------------------
 # VBench metrics (wrapping the official VBench library)
 # ---------------------------------------------------------------------------
 
