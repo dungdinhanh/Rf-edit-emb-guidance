@@ -59,9 +59,10 @@ def edit_single_image(
         t5.to(torch_device)
         clip.to(torch_device)
 
-    # Prepare embeddings
+    # Prepare embeddings (all done before model loads to GPU)
     inp_source = prepare(t5, clip, init_latent, prompt=source_prompt)
     inp_target = prepare(t5, clip, init_latent, prompt=target_prompt)
+    inp_uncond = prepare(t5, clip, init_latent, prompt="") if mode == "emb_guidance" else None
 
     if offload:
         t5.cpu()
@@ -80,12 +81,6 @@ def edit_single_image(
 
     # Denoising
     if mode == "emb_guidance":
-        inp_uncond = prepare(t5 if not offload else t5.to(torch_device),
-                           clip if not offload else clip.to(torch_device),
-                           init_latent, prompt="")
-        if offload:
-            t5.cpu(); clip.cpu(); torch.cuda.empty_cache()
-
         x, _ = denoise_emb_guidance(
             model,
             img=inp_target["img"], img_ids=inp_target["img_ids"],
