@@ -161,14 +161,12 @@ class SD3AttnGuidanceEditor:
             block.attn.processor = proc
 
             # Pre-hook: normalize uncond and store on processor before attention
+            # Block is called with kwargs: hidden_states, encoder_hidden_states, temb
             def make_pre_hook(block_ref, proc_ref, idx):
-                def pre_hook(module, args):
-                    # args = (hidden_states, encoder_hidden_states, temb)
-                    temb = args[2] if len(args) > 2 else None
-                    if temb is None and 'temb' in (args[1] if isinstance(args[1], dict) else {}):
-                        temb = args[1]['temb']
+                def pre_hook(module, args, kwargs):
+                    temb = kwargs.get('temb', None)
 
-                    uncond = self._uncond_state[0]
+                    uncond = self._uncond_state[0].to(temb.device)
                     if block_ref.context_pre_only:
                         norm_uncond = block_ref.norm1_context(uncond, temb)
                     else:
@@ -179,20 +177,19 @@ class SD3AttnGuidanceEditor:
 
             # Post-hook: propagate uncond through block's text FF
             def make_post_hook(block_ref, idx):
-                def post_hook(module, args, output):
+                def post_hook(module, args, kwargs, output):
                     if block_ref.context_pre_only:
                         return output
 
-                    temb = args[2] if len(args) > 2 else None
-                    uncond = self._uncond_state[0]
+                    temb = kwargs.get('temb', None)
+                    uncond = self._uncond_state[0].to(temb.device)
 
                     # Get uncond modulation params
                     _, u_gate_msa, u_shift_mlp, u_scale_mlp, u_gate_mlp = block_ref.norm1_context(
                         uncond, emb=temb
                     )
 
-                    # Run uncond attention output through the text FF
-                    # We approximate: skip attention update, just apply FF
+                    # Propagate uncond through the text FF (approximate: skip attention update)
                     norm_uncond_ff = block_ref.norm2_context(uncond)
                     norm_uncond_ff = norm_uncond_ff * (1 + u_scale_mlp[:, None]) + u_shift_mlp[:, None]
                     uncond_ff = block_ref.ff_context(norm_uncond_ff)
@@ -201,8 +198,8 @@ class SD3AttnGuidanceEditor:
                     return output
                 return post_hook
 
-            h1 = block.register_forward_pre_hook(make_pre_hook(block, proc, i))
-            h2 = block.register_forward_hook(make_post_hook(block, i))
+            h1 = block.register_forward_pre_hook(make_pre_hook(block, proc, i), with_kwargs=True)
+            h2 = block.register_forward_hook(make_post_hook(block, i), with_kwargs=True)
             self._hooks.extend([h1, h2])
 
     def _uninstall_guidance(self):
