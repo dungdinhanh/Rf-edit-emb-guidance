@@ -143,8 +143,8 @@ class SD3AttnGuidanceEditor:
 
         # Save original processors to restore later
         self.original_processors = {}
-        for name, block in self.pipe.transformer.transformer_blocks.items():
-            self.original_processors[name] = block.attn.processor
+        for i, block in enumerate(self.pipe.transformer.transformer_blocks):
+            self.original_processors[i] = block.attn.processor
         print("SD3 loaded.")
 
     def _install_guidance(self, uncond_embeds, attn_k, attn_alpha):
@@ -157,14 +157,11 @@ class SD3AttnGuidanceEditor:
         # We'll store the raw uncond and let each processor project it.
 
         self.guided_processors = {}
-        uncond_state = uncond_embeds.clone()
 
-        for name, block in transformer.transformer_blocks.items():
+        for i, block in enumerate(transformer.transformer_blocks):
             proc = GuidedJointAttnProcessor(attn_k=attn_k, attn_alpha=attn_alpha)
-            # We need to propagate uncond through each block's norm
-            # Store it and update after each block
             proc.uncond_encoder_hidden_states = None  # Will be set during forward
-            self.guided_processors[name] = proc
+            self.guided_processors[i] = proc
             block.attn.processor = proc
 
         # Patch the transformer forward to propagate uncond text
@@ -188,8 +185,8 @@ class SD3AttnGuidanceEditor:
             # Also project uncond text
             uncond_txt = transformer.context_embedder(uncond_embeds.to(encoder_hidden_states.device))
 
-            for name, block in transformer.transformer_blocks.items():
-                if name in guided_processors:
+            for i, block in enumerate(transformer.transformer_blocks):
+                if i in guided_processors:
                     # Set uncond text for this block's processor (after block's norm)
                     # The norm1_context is applied inside block.forward before passing to attn
                     # So we need to normalize uncond_txt the same way
@@ -199,7 +196,7 @@ class SD3AttnGuidanceEditor:
                         norm_uncond, u_gate_msa, u_shift_mlp, u_scale_mlp, u_gate_mlp = block.norm1_context(
                             uncond_txt, emb=temb
                         )
-                    guided_processors[name].uncond_encoder_hidden_states = norm_uncond
+                    guided_processors[i].uncond_encoder_hidden_states = norm_uncond
 
                 encoder_hidden_states, hidden_states = block(
                     hidden_states=hidden_states,
@@ -208,7 +205,7 @@ class SD3AttnGuidanceEditor:
                 )
 
                 # Propagate uncond text through the block's text path
-                if name in guided_processors and not block.context_pre_only:
+                if i in guided_processors and not block.context_pre_only:
                     # Run uncond through the same attention to get its updated state
                     # Use the attention output from the processor (already computed)
                     # Actually, we need to run uncond through its own attention + FF
@@ -246,9 +243,9 @@ class SD3AttnGuidanceEditor:
 
     def _uninstall_guidance(self):
         """Restore original processors and forward."""
-        for name, block in self.pipe.transformer.transformer_blocks.items():
-            if name in self.original_processors:
-                block.attn.processor = self.original_processors[name]
+        for i, block in enumerate(self.pipe.transformer.transformer_blocks):
+            if i in self.original_processors:
+                block.attn.processor = self.original_processors[i]
         if hasattr(self, '_original_transformer_forward'):
             self.pipe.transformer.forward = self._original_transformer_forward
 
