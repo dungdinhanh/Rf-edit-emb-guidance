@@ -71,15 +71,18 @@ class SD3HybridEditor:
             do_classifier_free_guidance=True,
             device=device,
         )
+        # Detach embeddings to free computation graph references
+        cond_embeds = cond_embeds.detach()
+        neg_embeds = neg_embeds.detach()
+        cond_pooled = cond_pooled.detach()
+        neg_pooled = neg_pooled.detach()
 
         if not self.offload:
-            # Move text encoders back to CPU to free GPU for denoising
             self.pipe.text_encoder.cpu()
             self.pipe.text_encoder_2.cpu()
             if self.pipe.text_encoder_3 is not None:
                 self.pipe.text_encoder_3.cpu()
-            import gc
-            gc.collect()
+            import gc; gc.collect()
             torch.cuda.empty_cache()
 
         # Prepare guided embeddings for emb guidance steps
