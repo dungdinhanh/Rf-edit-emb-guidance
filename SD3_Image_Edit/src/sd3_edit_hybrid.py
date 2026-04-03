@@ -28,9 +28,12 @@ class SD3HybridEditor:
         if offload:
             self.pipe.enable_sequential_cpu_offload(gpu_id=0)
         else:
-            self.pipe = self.pipe.to(self.device)
+            # Only move transformer and VAE to GPU, keep text encoders on CPU
+            self.pipe.transformer.to(self.device)
+            self.pipe.vae.to(self.device)
+            # Text encoders stay on CPU - we'll move them temporarily for encode_prompt
         self.pipe.set_progress_bar_config(disable=True)
-        self._text_encoders_offloaded = False
+        self._text_encoders_offloaded = True  # Start offloaded
         print("SD3 loaded.")
 
     def edit(self, source_image, source_prompt, target_prompt,
@@ -53,14 +56,14 @@ class SD3HybridEditor:
 
         device = self.pipe._execution_device
 
-        # Move text encoders to GPU for encoding if they were offloaded
-        if self._text_encoders_offloaded and not self.offload:
+        # Move text encoders to GPU for encoding, then back to CPU
+        if not self.offload:
+            # Temporarily move text encoders to GPU
             self.pipe.text_encoder.to(self.device)
             self.pipe.text_encoder_2.to(self.device)
             if self.pipe.text_encoder_3 is not None:
                 self.pipe.text_encoder_3.to(self.device)
 
-        # Encode prompts (both cond and uncond needed for CFG steps)
         (cond_embeds, neg_embeds,
          cond_pooled, neg_pooled) = self.pipe.encode_prompt(
             prompt=target_prompt, prompt_2=target_prompt, prompt_3=target_prompt,
@@ -69,14 +72,13 @@ class SD3HybridEditor:
             device=device,
         )
 
-        # Free text encoders from GPU — not needed during denoising
-        if not self.offload and not self._text_encoders_offloaded:
+        if not self.offload:
+            # Move text encoders back to CPU to free GPU for denoising
             self.pipe.text_encoder.cpu()
             self.pipe.text_encoder_2.cpu()
             if self.pipe.text_encoder_3 is not None:
                 self.pipe.text_encoder_3.cpu()
             torch.cuda.empty_cache()
-            self._text_encoders_offloaded = True
 
         # Prepare guided embeddings for emb guidance steps
         guided_embeds = (1.0 + emb_alpha) * cond_embeds - emb_alpha * neg_embeds
