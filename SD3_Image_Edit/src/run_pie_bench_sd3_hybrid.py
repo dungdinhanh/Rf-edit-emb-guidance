@@ -13,7 +13,7 @@ def main(args):
     if args.category:
         categories = [c for c in categories if c == args.category]
 
-    method_name = f"hybrid_a{args.emb_alpha}_cfg{args.cfg_scale}_k{args.cfg_steps}_{args.cfg_position}"
+    method_name = f"hybrid_a{args.emb_alpha}_cfg{args.cfg_scale}_k{args.cfg_steps}"
     total_processed, total_errors = 0, 0
 
     for cat in categories:
@@ -45,7 +45,7 @@ def main(args):
                     source_img, source_prompt, target_prompt,
                     num_steps=args.num_steps, strength=args.strength,
                     emb_alpha=args.emb_alpha, cfg_scale=args.cfg_scale,
-                    cfg_steps=args.cfg_steps, cfg_position=args.cfg_position,
+                    cfg_steps=args.cfg_steps,
                 )
                 edited_img.save(out_path, quality=95)
                 source_img.save(os.path.join(out_dir, f"{sample_id}_source.jpg"), quality=95)
@@ -53,7 +53,6 @@ def main(args):
                            'category': cat, 'sample_id': sample_id,
                            'mode': 'hybrid', 'emb_alpha': args.emb_alpha,
                            'cfg_scale': args.cfg_scale, 'cfg_steps': args.cfg_steps,
-                           'cfg_position': args.cfg_position,
                            'strength': args.strength, 'elapsed': elapsed},
                           open(os.path.join(out_dir, f"{sample_id}_meta.json"), 'w'), indent=2)
                 total_processed += 1
@@ -73,7 +72,6 @@ if __name__ == "__main__":
     parser.add_argument('--emb_alpha', type=float, default=0.3)
     parser.add_argument('--cfg_scale', type=float, default=7.0)
     parser.add_argument('--cfg_steps', type=int, default=3)
-    parser.add_argument('--cfg_position', default='last', choices=['first', 'last', 'middle'])
     parser.add_argument('--dataset_dir', required=True)
     parser.add_argument('--output_dir', required=True)
     parser.add_argument('--category', default=None)
