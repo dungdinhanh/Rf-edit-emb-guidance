@@ -64,18 +64,14 @@ class SD3HybridEditor:
             if self.pipe.text_encoder_3 is not None:
                 self.pipe.text_encoder_3.to(self.device)
 
-        (cond_embeds, neg_embeds,
-         cond_pooled, neg_pooled) = self.pipe.encode_prompt(
-            prompt=target_prompt, prompt_2=target_prompt, prompt_3=target_prompt,
-            negative_prompt="", negative_prompt_2="", negative_prompt_3="",
-            do_classifier_free_guidance=True,
-            device=device,
-        )
-        # Detach embeddings to free computation graph references
-        cond_embeds = cond_embeds.detach()
-        neg_embeds = neg_embeds.detach()
-        cond_pooled = cond_pooled.detach()
-        neg_pooled = neg_pooled.detach()
+        with torch.no_grad():
+            (cond_embeds, neg_embeds,
+             cond_pooled, neg_pooled) = self.pipe.encode_prompt(
+                prompt=target_prompt, prompt_2=target_prompt, prompt_3=target_prompt,
+                negative_prompt="", negative_prompt_2="", negative_prompt_3="",
+                do_classifier_free_guidance=True,
+                device=device,
+            )
 
         if not self.offload:
             self.pipe.text_encoder.cpu()
