@@ -30,6 +30,7 @@ class SD3HybridEditor:
         else:
             self.pipe = self.pipe.to(self.device)
         self.pipe.set_progress_bar_config(disable=True)
+        self._text_encoders_offloaded = False
         print("SD3 loaded.")
 
     def edit(self, source_image, source_prompt, target_prompt,
@@ -52,6 +53,13 @@ class SD3HybridEditor:
 
         device = self.pipe._execution_device
 
+        # Move text encoders to GPU for encoding if they were offloaded
+        if self._text_encoders_offloaded and not self.offload:
+            self.pipe.text_encoder.to(self.device)
+            self.pipe.text_encoder_2.to(self.device)
+            if self.pipe.text_encoder_3 is not None:
+                self.pipe.text_encoder_3.to(self.device)
+
         # Encode prompts (both cond and uncond needed for CFG steps)
         (cond_embeds, neg_embeds,
          cond_pooled, neg_pooled) = self.pipe.encode_prompt(
@@ -61,13 +69,14 @@ class SD3HybridEditor:
             device=device,
         )
 
-        # Free text encoders from GPU (no longer needed after encoding)
-        if not self.offload:
+        # Free text encoders from GPU — not needed during denoising
+        if not self.offload and not self._text_encoders_offloaded:
             self.pipe.text_encoder.cpu()
             self.pipe.text_encoder_2.cpu()
             if self.pipe.text_encoder_3 is not None:
                 self.pipe.text_encoder_3.cpu()
             torch.cuda.empty_cache()
+            self._text_encoders_offloaded = True
 
         # Prepare guided embeddings for emb guidance steps
         guided_embeds = (1.0 + emb_alpha) * cond_embeds - emb_alpha * neg_embeds
@@ -151,12 +160,8 @@ class SD3HybridEditor:
         image = self.pipe.vae.decode(latents, return_dict=False)[0]
         image = self.pipe.image_processor.postprocess(image, output_type="pil")[0]
 
-        # Restore text encoders to GPU for next call's encode_prompt
-        if not self.offload:
-            self.pipe.text_encoder.to(self.device)
-            self.pipe.text_encoder_2.to(self.device)
-            if self.pipe.text_encoder_3 is not None:
-                self.pipe.text_encoder_3.to(self.device)
+        # Note: text encoders stay on CPU. Caller must pre-encode prompts
+        # or call edit() which handles encoding before offload.
 
         elapsed = time.time() - t0
         return image, elapsed
