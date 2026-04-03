@@ -65,10 +65,6 @@ class SD3HybridEditor:
         guided_embeds = (1.0 + emb_alpha) * cond_embeds - emb_alpha * neg_embeds
         guided_pooled = (1.0 + emb_alpha) * cond_pooled - emb_alpha * neg_pooled
 
-        # Prepare CFG embeddings (concat cond + uncond for batch=2 forward)
-        cfg_prompt_embeds = torch.cat([neg_embeds, cond_embeds], dim=0)
-        cfg_pooled_embeds = torch.cat([neg_pooled, cond_pooled], dim=0)
-
         # Encode image to latents
         image_tensor = self.pipe.image_processor.preprocess(source_image)
         image_tensor = image_tensor.to(device=device, dtype=self.pipe.vae.dtype)
@@ -104,19 +100,25 @@ class SD3HybridEditor:
             use_cfg = i in cfg_step_indices
 
             if use_cfg:
-                # CFG: 2 forward passes (batch=2)
-                latent_input = torch.cat([latents] * 2)
-                timestep = t.expand(latent_input.shape[0])
+                # CFG: 2 sequential forward passes (saves memory vs batch=2)
+                timestep = t.expand(latents.shape[0])
 
-                noise_pred = self.pipe.transformer(
-                    hidden_states=latent_input,
+                noise_pred_uncond = self.pipe.transformer(
+                    hidden_states=latents,
                     timestep=timestep,
-                    encoder_hidden_states=cfg_prompt_embeds,
-                    pooled_projections=cfg_pooled_embeds,
+                    encoder_hidden_states=neg_embeds,
+                    pooled_projections=neg_pooled,
                     return_dict=False,
                 )[0]
 
-                noise_pred_uncond, noise_pred_cond = noise_pred.chunk(2)
+                noise_pred_cond = self.pipe.transformer(
+                    hidden_states=latents,
+                    timestep=timestep,
+                    encoder_hidden_states=cond_embeds,
+                    pooled_projections=cond_pooled,
+                    return_dict=False,
+                )[0]
+
                 noise_pred = noise_pred_uncond + cfg_scale * (noise_pred_cond - noise_pred_uncond)
             else:
                 # Embedding guidance: 1 forward pass
