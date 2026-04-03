@@ -78,6 +78,8 @@ class SD3HybridEditor:
             self.pipe.text_encoder_2.cpu()
             if self.pipe.text_encoder_3 is not None:
                 self.pipe.text_encoder_3.cpu()
+            import gc
+            gc.collect()
             torch.cuda.empty_cache()
 
         # Prepare guided embeddings for emb guidance steps
