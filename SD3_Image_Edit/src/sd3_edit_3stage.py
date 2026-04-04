@@ -59,36 +59,19 @@ class SD3ThreeStageEditor:
 
         device = self.device
 
-        # Move text encoders to GPU, encode, move back
-        self.pipe.text_encoder.to(device)
-        self.pipe.text_encoder_2.to(device)
-        if self.pipe.text_encoder_3 is not None:
-            self.pipe.text_encoder_3.to(device)
-
+        # Encode prompts on CPU (text encoders stay on CPU, fast enough)
         (cond_embeds, neg_embeds,
          cond_pooled, neg_pooled) = self.pipe.encode_prompt(
             prompt=target_prompt, prompt_2=target_prompt, prompt_3=target_prompt,
             negative_prompt="", negative_prompt_2="", negative_prompt_3="",
             do_classifier_free_guidance=True,
-            device=device,
+            device="cpu",
         )
-        # Detach to break computation graph, then free text encoders
-        cond_embeds, neg_embeds = cond_embeds.detach(), neg_embeds.detach()
-        cond_pooled, neg_pooled = cond_pooled.detach(), neg_pooled.detach()
-
-        self.pipe.text_encoder.to("cpu")
-        self.pipe.text_encoder_2.to("cpu")
-        if self.pipe.text_encoder_3 is not None:
-            self.pipe.text_encoder_3.to("cpu")
-        # Remove accelerate hooks if present (hold references)
-        for enc in [self.pipe.text_encoder, self.pipe.text_encoder_2, self.pipe.text_encoder_3]:
-            if enc is not None and hasattr(enc, '_hf_hook'):
-                try:
-                    del enc._hf_hook
-                except AttributeError:
-                    pass
-        gc.collect()
-        torch.cuda.empty_cache()
+        # Move embeddings to GPU
+        cond_embeds = cond_embeds.to(device)
+        neg_embeds = neg_embeds.to(device)
+        cond_pooled = cond_pooled.to(device)
+        neg_pooled = neg_pooled.to(device)
 
         # Prepare guided embeddings
         guided_embeds = (1.0 + emb_alpha) * cond_embeds - emb_alpha * neg_embeds
