@@ -6,13 +6,11 @@ Three guidance modes applied at different timestep ranges:
 2. CFG (cond + uncond, prediction-space) — strong editing signal
 3. Embedding guidance (blended embeddings) — smooth refinement
 
-Each step's mode is determined by which range it falls in.
-Ranges are specified as fractions of total denoising steps.
+Uses the exact same memory pattern as the standard SD3 img2img pipeline.
 """
 
 import os
 import time
-import gc
 
 import torch
 import numpy as np
@@ -22,15 +20,15 @@ from diffusers import StableDiffusion3Img2ImgPipeline
 
 class SD3ThreeStageEditor:
     def __init__(self, model_id="stabilityai/stable-diffusion-3-medium-diffusers",
-                 device="cuda"):
+                 device="cuda", offload=False):
         self.device = torch.device(device)
 
         print("Loading SD3 pipeline...")
         self.pipe = StableDiffusion3Img2ImgPipeline.from_pretrained(model_id, torch_dtype=torch.bfloat16)
-        # Load only transformer + VAE to GPU. Text encoders stay on CPU.
-        # Same memory footprint as normal pipeline during denoising.
-        self.pipe.transformer.to(self.device)
-        self.pipe.vae.to(self.device)
+        if offload:
+            self.pipe.enable_sequential_cpu_offload(gpu_id=0)
+        else:
+            self.pipe = self.pipe.to(self.device)
         self.pipe.set_progress_bar_config(disable=True)
         print("SD3 loaded.")
 
@@ -43,13 +41,9 @@ class SD3ThreeStageEditor:
         Three-stage editing within a single denoising trajectory.
 
         Args:
-            cfg_range: (start_frac, end_frac) — fraction of total steps for CFG.
-                       e.g., (0.3, 0.7) means CFG from step 30% to 70%.
-            emb_range: (start_frac, end_frac) — fraction for emb guidance.
-                       e.g., (0.7, 1.0) means emb guidance from 70% to end.
-            Steps outside both ranges use no guidance (cond only).
-
-        Stage assignment priority: if ranges overlap, CFG takes precedence.
+            cfg_range: (start_frac, end_frac) — fraction of total steps for CFG
+            emb_range: (start_frac, end_frac) — fraction for emb guidance
+            Steps outside both ranges use no guidance (cond only)
         """
         t0 = time.time()
 
@@ -57,27 +51,22 @@ class SD3ThreeStageEditor:
         w, h = w - w % 16, h - h % 16
         source_image = source_image.resize((w, h))
 
-        device = self.device
+        device = self.pipe._execution_device
 
-        # Encode prompts on CPU (text encoders stay on CPU, fast enough)
+        # Pre-encode prompts (same as standard pipeline)
         (cond_embeds, neg_embeds,
          cond_pooled, neg_pooled) = self.pipe.encode_prompt(
             prompt=target_prompt, prompt_2=target_prompt, prompt_3=target_prompt,
             negative_prompt="", negative_prompt_2="", negative_prompt_3="",
             do_classifier_free_guidance=True,
-            device="cpu",
+            device=device,
         )
-        # Move embeddings to GPU
-        cond_embeds = cond_embeds.to(device)
-        neg_embeds = neg_embeds.to(device)
-        cond_pooled = cond_pooled.to(device)
-        neg_pooled = neg_pooled.to(device)
 
-        # Prepare guided embeddings
+        # Prepare guided embeddings for emb guidance stages
         guided_embeds = (1.0 + emb_alpha) * cond_embeds - emb_alpha * neg_embeds
         guided_pooled = (1.0 + emb_alpha) * cond_pooled - emb_alpha * neg_pooled
 
-        # Encode image (VAE already on GPU)
+        # Encode image to latents
         image_tensor = self.pipe.image_processor.preprocess(source_image)
         image_tensor = image_tensor.to(device=device, dtype=self.pipe.vae.dtype)
         latents = self.pipe.vae.encode(image_tensor).latent_dist.sample()
@@ -100,7 +89,7 @@ class SD3ThreeStageEditor:
         emb_start = int(total_steps * emb_range[0])
         emb_end = int(total_steps * emb_range[1])
 
-        # Build per-step mode assignment
+        # Build per-step mode
         step_modes = []
         for i in range(total_steps):
             if cfg_start <= i < cfg_end:
@@ -114,42 +103,42 @@ class SD3ThreeStageEditor:
         emb_count = step_modes.count("emb")
         none_count = step_modes.count("none")
 
-        # Transformer and VAE already on GPU
+        # Denoising loop — same as pipeline but with mode switching
         for i, t in enumerate(timesteps):
             mode = step_modes[i]
             timestep = t.expand(latents.shape[0])
 
             if mode == "cfg":
-                # Sequential CFG
-                noise_pred_uncond = self.pipe.transformer(
-                    hidden_states=latents, timestep=timestep,
-                    encoder_hidden_states=neg_embeds,
-                    pooled_projections=neg_pooled,
+                # CFG: batch=2 like standard pipeline
+                latent_input = torch.cat([latents] * 2)
+                timestep_input = t.expand(latent_input.shape[0])
+                prompt_input = torch.cat([neg_embeds, cond_embeds], dim=0)
+                pooled_input = torch.cat([neg_pooled, cond_pooled], dim=0)
+
+                noise_pred = self.pipe.transformer(
+                    hidden_states=latent_input,
+                    timestep=timestep_input,
+                    encoder_hidden_states=prompt_input,
+                    pooled_projections=pooled_input,
                     return_dict=False,
                 )[0]
 
-                noise_pred_cond = self.pipe.transformer(
-                    hidden_states=latents, timestep=timestep,
-                    encoder_hidden_states=cond_embeds,
-                    pooled_projections=cond_pooled,
-                    return_dict=False,
-                )[0]
-
+                noise_pred_uncond, noise_pred_cond = noise_pred.chunk(2)
                 noise_pred = noise_pred_uncond + cfg_scale * (noise_pred_cond - noise_pred_uncond)
 
             elif mode == "emb":
-                # Embedding guidance
                 noise_pred = self.pipe.transformer(
-                    hidden_states=latents, timestep=timestep,
+                    hidden_states=latents,
+                    timestep=timestep,
                     encoder_hidden_states=guided_embeds,
                     pooled_projections=guided_pooled,
                     return_dict=False,
                 )[0]
 
-            else:
-                # No guidance — cond only
+            else:  # none
                 noise_pred = self.pipe.transformer(
-                    hidden_states=latents, timestep=timestep,
+                    hidden_states=latents,
+                    timestep=timestep,
                     encoder_hidden_states=cond_embeds,
                     pooled_projections=cond_pooled,
                     return_dict=False,
@@ -160,12 +149,11 @@ class SD3ThreeStageEditor:
             if latents.dtype != latents_dtype:
                 latents = latents.to(latents_dtype)
 
-        # Decode (VAE already on GPU)
+        # Decode
         latents = latents / self.pipe.vae.config.scaling_factor + self.pipe.vae.config.shift_factor
         image = self.pipe.vae.decode(latents, return_dict=False)[0]
         image = self.pipe.image_processor.postprocess(image, output_type="pil")[0]
 
         elapsed = time.time() - t0
         return image, elapsed, {"cfg_steps": cfg_count, "emb_steps": emb_count,
-                                "none_steps": none_count, "total_steps": total_steps,
-                                "step_modes": step_modes}
+                                "none_steps": none_count, "total_steps": total_steps}
