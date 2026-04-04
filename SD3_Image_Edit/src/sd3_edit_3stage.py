@@ -27,7 +27,10 @@ class SD3ThreeStageEditor:
 
         print("Loading SD3 pipeline...")
         self.pipe = StableDiffusion3Img2ImgPipeline.from_pretrained(model_id, torch_dtype=torch.bfloat16)
-        self.pipe.enable_model_cpu_offload(gpu_id=0)
+        # Load only transformer + VAE to GPU. Text encoders stay on CPU.
+        # Same memory footprint as normal pipeline during denoising.
+        self.pipe.transformer.to(self.device)
+        self.pipe.vae.to(self.device)
         self.pipe.set_progress_bar_config(disable=True)
         print("SD3 loaded.")
 
@@ -54,9 +57,14 @@ class SD3ThreeStageEditor:
         w, h = w - w % 16, h - h % 16
         source_image = source_image.resize((w, h))
 
-        device = self.pipe._execution_device
+        device = self.device
 
-        # Encode prompts
+        # Move text encoders to GPU, encode, move back
+        self.pipe.text_encoder.to(device)
+        self.pipe.text_encoder_2.to(device)
+        if self.pipe.text_encoder_3 is not None:
+            self.pipe.text_encoder_3.to(device)
+
         (cond_embeds, neg_embeds,
          cond_pooled, neg_pooled) = self.pipe.encode_prompt(
             prompt=target_prompt, prompt_2=target_prompt, prompt_3=target_prompt,
@@ -64,22 +72,31 @@ class SD3ThreeStageEditor:
             do_classifier_free_guidance=True,
             device=device,
         )
+        # Detach to break computation graph, then free text encoders
+        cond_embeds, neg_embeds = cond_embeds.detach(), neg_embeds.detach()
+        cond_pooled, neg_pooled = cond_pooled.detach(), neg_pooled.detach()
 
-        # Prepare guided embeddings for emb guidance stages
+        self.pipe.text_encoder.to("cpu")
+        self.pipe.text_encoder_2.to("cpu")
+        if self.pipe.text_encoder_3 is not None:
+            self.pipe.text_encoder_3.to("cpu")
+        del self.pipe.text_encoder._hf_hook  # Remove accelerate hooks that hold references
+        del self.pipe.text_encoder_2._hf_hook
+        if self.pipe.text_encoder_3 is not None and hasattr(self.pipe.text_encoder_3, '_hf_hook'):
+            del self.pipe.text_encoder_3._hf_hook
+        gc.collect()
+        torch.cuda.empty_cache()
+
+        # Prepare guided embeddings
         guided_embeds = (1.0 + emb_alpha) * cond_embeds - emb_alpha * neg_embeds
         guided_pooled = (1.0 + emb_alpha) * cond_pooled - emb_alpha * neg_pooled
 
-        # Encode image
+        # Encode image (VAE already on GPU)
         image_tensor = self.pipe.image_processor.preprocess(source_image)
         image_tensor = image_tensor.to(device=device, dtype=self.pipe.vae.dtype)
         latents = self.pipe.vae.encode(image_tensor).latent_dist.sample()
         latents = (latents - self.pipe.vae.config.shift_factor) * self.pipe.vae.config.scaling_factor
         latents = latents.to(dtype=cond_embeds.dtype)
-
-        # Free VAE
-        self.pipe.vae.to("cpu")
-        gc.collect()
-        torch.cuda.empty_cache()
 
         # Setup timesteps
         self.pipe.scheduler.set_timesteps(num_steps, device=device)
@@ -111,9 +128,7 @@ class SD3ThreeStageEditor:
         emb_count = step_modes.count("emb")
         none_count = step_modes.count("none")
 
-        # Move transformer to GPU
-        self.pipe.transformer.to(device)
-
+        # Transformer and VAE already on GPU
         for i, t in enumerate(timesteps):
             mode = step_modes[i]
             timestep = t.expand(latents.shape[0])
@@ -122,15 +137,15 @@ class SD3ThreeStageEditor:
                 # Sequential CFG
                 noise_pred_uncond = self.pipe.transformer(
                     hidden_states=latents, timestep=timestep,
-                    encoder_hidden_states=neg_embeds.to(device),
-                    pooled_projections=neg_pooled.to(device),
+                    encoder_hidden_states=neg_embeds,
+                    pooled_projections=neg_pooled,
                     return_dict=False,
                 )[0]
 
                 noise_pred_cond = self.pipe.transformer(
                     hidden_states=latents, timestep=timestep,
-                    encoder_hidden_states=cond_embeds.to(device),
-                    pooled_projections=cond_pooled.to(device),
+                    encoder_hidden_states=cond_embeds,
+                    pooled_projections=cond_pooled,
                     return_dict=False,
                 )[0]
 
@@ -140,8 +155,8 @@ class SD3ThreeStageEditor:
                 # Embedding guidance
                 noise_pred = self.pipe.transformer(
                     hidden_states=latents, timestep=timestep,
-                    encoder_hidden_states=guided_embeds.to(device),
-                    pooled_projections=guided_pooled.to(device),
+                    encoder_hidden_states=guided_embeds,
+                    pooled_projections=guided_pooled,
                     return_dict=False,
                 )[0]
 
@@ -149,8 +164,8 @@ class SD3ThreeStageEditor:
                 # No guidance — cond only
                 noise_pred = self.pipe.transformer(
                     hidden_states=latents, timestep=timestep,
-                    encoder_hidden_states=cond_embeds.to(device),
-                    pooled_projections=cond_pooled.to(device),
+                    encoder_hidden_states=cond_embeds,
+                    pooled_projections=cond_pooled,
                     return_dict=False,
                 )[0]
 
@@ -159,17 +174,10 @@ class SD3ThreeStageEditor:
             if latents.dtype != latents_dtype:
                 latents = latents.to(latents_dtype)
 
-        # Decode
-        self.pipe.transformer.to("cpu")
-        gc.collect(); torch.cuda.empty_cache()
-
-        self.pipe.vae.to(device)
+        # Decode (VAE already on GPU)
         latents = latents / self.pipe.vae.config.scaling_factor + self.pipe.vae.config.shift_factor
         image = self.pipe.vae.decode(latents, return_dict=False)[0]
         image = self.pipe.image_processor.postprocess(image, output_type="pil")[0]
-
-        self.pipe.vae.to("cpu")
-        gc.collect(); torch.cuda.empty_cache()
 
         elapsed = time.time() - t0
         return image, elapsed, {"cfg_steps": cfg_count, "emb_steps": emb_count,
