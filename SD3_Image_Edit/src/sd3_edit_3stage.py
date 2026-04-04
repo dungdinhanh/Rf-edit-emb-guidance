@@ -80,10 +80,13 @@ class SD3ThreeStageEditor:
         self.pipe.text_encoder_2.to("cpu")
         if self.pipe.text_encoder_3 is not None:
             self.pipe.text_encoder_3.to("cpu")
-        del self.pipe.text_encoder._hf_hook  # Remove accelerate hooks that hold references
-        del self.pipe.text_encoder_2._hf_hook
-        if self.pipe.text_encoder_3 is not None and hasattr(self.pipe.text_encoder_3, '_hf_hook'):
-            del self.pipe.text_encoder_3._hf_hook
+        # Remove accelerate hooks if present (hold references)
+        for enc in [self.pipe.text_encoder, self.pipe.text_encoder_2, self.pipe.text_encoder_3]:
+            if enc is not None and hasattr(enc, '_hf_hook'):
+                try:
+                    del enc._hf_hook
+                except AttributeError:
+                    pass
         gc.collect()
         torch.cuda.empty_cache()
 
