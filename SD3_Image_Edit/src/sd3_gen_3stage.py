@@ -63,8 +63,9 @@ class SD3ThreeStageGenerator:
         timesteps = self.pipe.scheduler.timesteps
         total_steps = len(timesteps)
 
-        # Scale initial noise
-        latents = latents * self.pipe.scheduler.init_noise_sigma
+        # Scale initial noise (FlowMatch doesn't need scaling, but check)
+        if hasattr(self.pipe.scheduler, 'init_noise_sigma'):
+            latents = latents * self.pipe.scheduler.init_noise_sigma
 
         # Convert ranges to step indices
         cfg_start = int(total_steps * cfg_range[0])
