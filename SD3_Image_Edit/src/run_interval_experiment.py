@@ -22,7 +22,12 @@ def run_generation(args):
 
     cfg_range = (args.cfg_start, args.cfg_end)
     emb_range = (args.emb_start, args.emb_end)
-    method_name = f"gen_cfg{args.cfg_start}-{args.cfg_end}_emb{args.emb_start}-{args.emb_end}"
+    emb_early_range = (args.emb_early_start, args.emb_early_end) if args.emb_early_start < args.emb_early_end else None
+    emb_early_alpha = args.emb_early_alpha
+
+    method_name = f"gen_cfg{args.cfg_start}-{args.cfg_end}_emb{args.emb_start}-{args.emb_end}_a{args.emb_alpha}"
+    if emb_early_range:
+        method_name += f"_eemb{args.emb_early_start}-{args.emb_early_end}_ea{emb_early_alpha}"
     total_processed = 0
 
     for cat in categories:
@@ -47,7 +52,9 @@ def run_generation(args):
                 img, elapsed, info = gen.generate(
                     target_prompt, num_steps=args.num_steps,
                     cfg_scale=args.cfg_scale, cfg_range=cfg_range,
-                    emb_range=emb_range, emb_alpha=args.emb_alpha, seed=42,
+                    emb_range=emb_range, emb_alpha=args.emb_alpha,
+                    emb_early_range=emb_early_range, emb_early_alpha=emb_early_alpha,
+                    seed=42,
                 )
                 img.save(out_path, quality=95)
                 json.dump({'target_prompt': target_prompt, 'category': cat,
@@ -137,6 +144,9 @@ if __name__ == "__main__":
     parser.add_argument('--cfg_end', type=float, default=1.0)
     parser.add_argument('--emb_start', type=float, default=1.0)
     parser.add_argument('--emb_end', type=float, default=1.0)
+    parser.add_argument('--emb_early_start', type=float, default=0.0)
+    parser.add_argument('--emb_early_end', type=float, default=0.0)
+    parser.add_argument('--emb_early_alpha', type=float, default=None)
     parser.add_argument('--dataset_dir', required=True)
     parser.add_argument('--output_dir', required=True)
     parser.add_argument('--category', default=None)

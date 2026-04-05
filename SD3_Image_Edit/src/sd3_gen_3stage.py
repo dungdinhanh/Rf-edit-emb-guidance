@@ -32,8 +32,14 @@ class SD3ThreeStageGenerator:
     @torch.no_grad()
     def generate(self, prompt, num_steps=25, cfg_scale=7.0,
                  cfg_range=(0.3, 0.7), emb_range=(0.7, 1.0),
-                 emb_alpha=0.3, height=512, width=512, seed=42):
-        """Three-stage generation from pure noise."""
+                 emb_alpha=0.3, emb_early_range=None, emb_early_alpha=None,
+                 height=512, width=512, seed=42):
+        """Three-stage generation from pure noise.
+
+        Supports two separate emb ranges:
+        - emb_range + emb_alpha: primary emb range (typically late)
+        - emb_early_range + emb_early_alpha: optional early emb range
+        """
         t0 = time.time()
         device = self.pipe._execution_device
 
@@ -46,9 +52,14 @@ class SD3ThreeStageGenerator:
             device=device,
         )
 
-        # Prepare guided embeddings
+        # Prepare guided embeddings (primary / late)
         guided_embeds = (1.0 + emb_alpha) * cond_embeds - emb_alpha * neg_embeds
         guided_pooled = (1.0 + emb_alpha) * cond_pooled - emb_alpha * neg_pooled
+
+        # Prepare early guided embeddings (separate alpha)
+        ea = emb_early_alpha if emb_early_alpha is not None else emb_alpha
+        guided_early_embeds = (1.0 + ea) * cond_embeds - ea * neg_embeds
+        guided_early_pooled = (1.0 + ea) * cond_pooled - ea * neg_pooled
 
         # Generate initial noise
         generator = torch.Generator(device=device).manual_seed(seed)
@@ -73,10 +84,19 @@ class SD3ThreeStageGenerator:
         emb_start = int(total_steps * emb_range[0])
         emb_end = int(total_steps * emb_range[1])
 
+        # Early emb range
+        if emb_early_range is not None:
+            emb_early_start = int(total_steps * emb_early_range[0])
+            emb_early_end = int(total_steps * emb_early_range[1])
+        else:
+            emb_early_start, emb_early_end = 0, 0
+
         step_modes = []
         for i in range(total_steps):
             if cfg_start <= i < cfg_end:
                 step_modes.append("cfg")
+            elif emb_early_start <= i < emb_early_end:
+                step_modes.append("emb_early")
             elif emb_start <= i < emb_end:
                 step_modes.append("emb")
             else:
@@ -106,6 +126,14 @@ class SD3ThreeStageGenerator:
                 )[0]
                 noise_pred_uncond, noise_pred_cond = noise_pred.chunk(2)
                 noise_pred = noise_pred_uncond + cfg_scale * (noise_pred_cond - noise_pred_uncond)
+
+            elif mode == "emb_early":
+                noise_pred = self.pipe.transformer(
+                    hidden_states=latents, timestep=timestep,
+                    encoder_hidden_states=guided_early_embeds,
+                    pooled_projections=guided_early_pooled,
+                    return_dict=False,
+                )[0]
 
             elif mode == "emb":
                 noise_pred = self.pipe.transformer(
