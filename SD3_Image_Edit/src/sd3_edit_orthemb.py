@@ -1,16 +1,18 @@
 """
-SD3 Editing with Normalized + Orthogonal Embedding Guidance.
+SD3 Editing with Orthogonal Embedding Guidance.
 
-Two-step procedure to keep guidance non-conflicting with cond direction:
+Decompose the guidance direction (cond - uncond) into parallel and
+orthogonal components relative to cond. Use only the orthogonal part:
 
-  1. Compute guided vector: v = cond + α*(cond - uncond)
-  2. Normalize v to magnitude ||cond||  (keep magnitude in distribution)
-  3. Project v_norm onto plane orthogonal to cond (remove parallel component)
-  4. Final = cond + orthogonal_component
+  direction = cond - uncond
+  parallel  = (direction · cond / ||cond||²) · cond     # along cond
+  orth_dir  = direction - parallel                       # perpendicular
+  guided    = cond + α · orth_dir
 
-The orthogonal component is the part of the guidance signal that doesn't
-conflict with the cond direction — it adds perpendicular "rotation" guidance
-without canceling or amplifying cond itself.
+The parallel component just scales cond (no new information).
+The orthogonal component is the genuinely new direction the guidance brings.
+By adding only α times the orthogonal direction to cond, we get pure rotation
+guidance with no magnitude blowup and no conflict with cond.
 """
 
 import os
@@ -20,34 +22,34 @@ from PIL import Image
 from diffusers import StableDiffusion3Img2ImgPipeline
 
 
-def norm_then_orth_guidance(cond, uncond, alpha):
+def orth_guidance(cond, uncond, alpha):
     """
-    Compute v = cond + alpha*(cond - uncond)
-    Normalize to ||cond||, then project onto plane orthogonal to cond.
-    Final = cond + orthogonal component.
+    Decompose (cond - uncond) into parallel + orthogonal w.r.t. cond.
+    Use only the orthogonal component as guidance.
 
-    All ops are per-token (last dim treated as the vector dim).
+      direction = cond - uncond
+      parallel  = (direction · cond / ||cond||²) · cond
+      orth_dir  = direction - parallel
+      guided    = cond + alpha * orth_dir
+
+    Per-token operation (last dim is the vector dim).
     """
     cond_f = cond.float()
     uncond_f = uncond.float()
 
-    # Step 1: standard guided vector
-    v = cond_f + alpha * (cond_f - uncond_f)
+    # Guidance direction
+    direction = cond_f - uncond_f
 
-    # Step 2: normalize v to per-token magnitude of cond
-    cond_norm = cond_f.norm(dim=-1, keepdim=True)
-    v_norm = v.norm(dim=-1, keepdim=True) + 1e-8
-    v_normalized = v * (cond_norm / v_norm)
-
-    # Step 3: project v_normalized onto plane orthogonal to cond
-    # parallel component = (v · cond / ||cond||²) * cond
+    # Project direction onto cond → parallel component
     cond_norm_sq = (cond_f * cond_f).sum(dim=-1, keepdim=True) + 1e-8
-    proj_coef = (v_normalized * cond_f).sum(dim=-1, keepdim=True) / cond_norm_sq
+    proj_coef = (direction * cond_f).sum(dim=-1, keepdim=True) / cond_norm_sq
     parallel = proj_coef * cond_f
-    orthogonal = v_normalized - parallel
 
-    # Step 4: final = cond + orthogonal guidance signal
-    final = cond_f + orthogonal
+    # Orthogonal component = direction minus parallel
+    orth_dir = direction - parallel
+
+    # Final guided embedding
+    final = cond_f + alpha * orth_dir
 
     return final.to(cond.dtype)
 
@@ -79,9 +81,9 @@ class SD3OrthEmbEditor:
             device=self.pipe._execution_device,
         )
 
-        # Apply norm-then-orthogonal guidance
-        guided_embeds = norm_then_orth_guidance(cond_embeds, neg_embeds, emb_alpha)
-        guided_pooled = norm_then_orth_guidance(cond_pooled, neg_pooled, emb_alpha)
+        # Apply orthogonal guidance
+        guided_embeds = orth_guidance(cond_embeds, neg_embeds, emb_alpha)
+        guided_pooled = orth_guidance(cond_pooled, neg_pooled, emb_alpha)
 
         result = self.pipe(
             prompt_embeds=guided_embeds,
