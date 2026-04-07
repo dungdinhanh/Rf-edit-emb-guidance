@@ -22,36 +22,52 @@ from PIL import Image
 from diffusers import StableDiffusion3Img2ImgPipeline
 
 
-def orth_guidance(cond, uncond, alpha):
+def orth_guidance(cond, uncond, alpha, normalize=True):
     """
-    Decompose (cond - uncond) into parallel + orthogonal w.r.t. cond.
-    Use only the orthogonal component as guidance.
+    Conditional orthogonal guidance:
+    - If cos(direction, cond) >= 0 (no conflict): use standard guidance
+        guided = cond + alpha * (cond - uncond)
+        then normalize magnitude back to ||cond||
+    - If cos(direction, cond) < 0 (conflict): project out the conflicting
+        parallel component, use only orthogonal
+        guided = cond + alpha * orth_dir
 
-      direction = cond - uncond
-      parallel  = (direction · cond / ||cond||²) · cond
-      orth_dir  = direction - parallel
-      guided    = cond + alpha * orth_dir
-
-    Per-token operation (last dim is the vector dim).
+    Per-token decision (each token's vector has its own dot product).
     """
     cond_f = cond.float()
     uncond_f = uncond.float()
 
-    # Guidance direction
     direction = cond_f - uncond_f
 
-    # Project direction onto cond → parallel component
-    cond_norm_sq = (cond_f * cond_f).sum(dim=-1, keepdim=True) + 1e-8
-    proj_coef = (direction * cond_f).sum(dim=-1, keepdim=True) / cond_norm_sq
-    parallel = proj_coef * cond_f
+    # Per-token dot product (sign indicates alignment)
+    dot = (direction * cond_f).sum(dim=-1, keepdim=True)  # [..., 1]
 
-    # Orthogonal component = direction minus parallel
+    # Parallel component
+    cond_norm_sq = (cond_f * cond_f).sum(dim=-1, keepdim=True) + 1e-8
+    proj_coef = dot / cond_norm_sq
+    parallel = proj_coef * cond_f
     orth_dir = direction - parallel
 
-    # Final guided embedding
-    final = cond_f + alpha * orth_dir
+    # Two paths:
+    # (a) dot >= 0: direction aligns with cond → use full direction
+    # (b) dot < 0: direction conflicts → use only orthogonal
+    aligned_mask = (dot >= 0).float()  # 1 where aligned, 0 where conflict
 
-    return final.to(cond.dtype)
+    # Effective guidance direction:
+    #   aligned tokens → direction (full)
+    #   conflicting tokens → orth_dir (perpendicular only)
+    eff_dir = aligned_mask * direction + (1.0 - aligned_mask) * orth_dir
+
+    # Apply guidance
+    guided = cond_f + alpha * eff_dir
+
+    if normalize:
+        # Normalize per-token magnitude back to ||cond||
+        guided_norm = guided.norm(dim=-1, keepdim=True) + 1e-8
+        cond_norm = cond_f.norm(dim=-1, keepdim=True)
+        guided = guided * (cond_norm / guided_norm)
+
+    return guided.to(cond.dtype)
 
 
 class SD3OrthEmbEditor:
