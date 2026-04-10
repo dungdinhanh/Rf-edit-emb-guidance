@@ -136,8 +136,8 @@ def visualize_comparison(attn_cond, attn_guided, layer_idx, save_path,
                          prompt, emb_alpha, img_hw=None):
     """Create side-by-side attention heatmaps."""
     # Average over heads: [B, img_len, txt_len]
-    cond_avg = attn_cond[0].mean(dim=0).numpy()  # [img_len, txt_len]
-    guided_avg = attn_guided[0].mean(dim=0).numpy()
+    cond_avg = attn_cond[0].float().mean(dim=0).numpy()  # [img_len, txt_len]
+    guided_avg = attn_guided[0].float().mean(dim=0).numpy()
 
     # Also compute per-token importance (sum over image tokens)
     cond_importance = cond_avg.sum(axis=0)  # [txt_len]
@@ -195,8 +195,8 @@ def visualize_comparison(attn_cond, attn_guided, layer_idx, save_path,
 def visualize_spatial(attn_cond, attn_guided, layer_idx, save_path,
                       prompt, emb_alpha, img_h, img_w):
     """Visualize spatial attention pattern for top text tokens."""
-    cond_avg = attn_cond[0].mean(dim=0).numpy()  # [img_len, txt_len]
-    guided_avg = attn_guided[0].mean(dim=0).numpy()
+    cond_avg = attn_cond[0].float().mean(dim=0).numpy()  # [img_len, txt_len]
+    guided_avg = attn_guided[0].float().mean(dim=0).numpy()
 
     # Find top-5 text tokens with most change
     diff_importance = guided_avg.sum(axis=0) - cond_avg.sum(axis=0)
