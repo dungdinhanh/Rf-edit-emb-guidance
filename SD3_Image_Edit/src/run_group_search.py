@@ -4,9 +4,13 @@ Grouped per-layer alpha search for SD3 embedding guidance.
 Splits 24 layers into groups and greedily searches each group's alpha.
 Strategy: fix all groups, sweep one at a time, pick best, move to next.
 """
-import os, json, time, io, argparse
+import os, sys, json, time, io, argparse
 import torch, numpy as np, pandas as pd
 from PIL import Image
+
+# Add RF-Solver-Edit root to path for evaluation module
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', '..'))
+
 from sd3_edit_perlayer import SD3PerLayerEditor
 from evaluation.metrics import compute_clip_score
 
@@ -47,10 +51,6 @@ def evaluate_config(editor, dataset_dir, custom_alphas, max_samples=None, device
 
 
 def main(args):
-    # Import evaluation
-    import sys
-    sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', '..'))
-
     editor = SD3PerLayerEditor(model_id=args.model_id)
     num_layers = editor.num_layers  # 24
 
