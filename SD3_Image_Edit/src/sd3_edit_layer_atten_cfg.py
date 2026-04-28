@@ -68,7 +68,7 @@ class AttenCFGProcessor:
         c_k = attn.add_k_proj(encoder_hidden_states).view(batch_size, -1, attn.heads, head_dim).transpose(1, 2)
         c_v = attn.add_v_proj(encoder_hidden_states).view(batch_size, -1, attn.heads, head_dim).transpose(1, 2)
 
-        if self.uncond_enc is not None and self.scale > 1.0:
+        if self.uncond_enc is not None and self.scale != 1.0:
             # Uncond text QKV
             u_q = attn.add_q_proj(self.uncond_enc).view(batch_size, -1, attn.heads, head_dim).transpose(1, 2)
             u_k = attn.add_k_proj(self.uncond_enc).view(batch_size, -1, attn.heads, head_dim).transpose(1, 2)

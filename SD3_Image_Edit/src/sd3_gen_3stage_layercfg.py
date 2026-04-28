@@ -53,7 +53,7 @@ class SD3GenThreeStageLayerCFG:
             if block.context_pre_only:
                 _, hidden_states = block(hidden_states=hidden_states,
                     encoder_hidden_states=enc_cond, temb=temb)
-            elif scale_i <= 1.0:
+            elif scale_i == 1.0:
                 enc_cond, hidden_states = block(hidden_states=hidden_states,
                     encoder_hidden_states=enc_cond, temb=temb)
             else:
