@@ -138,7 +138,7 @@ def main():
     device = torch.device("cuda")
     print("Loading pipeline...")
     pipe = StableDiffusion3Img2ImgPipeline.from_pretrained(args.model_id, torch_dtype=torch.bfloat16)
-    pipe = pipe.to(device)
+    pipe.enable_sequential_cpu_offload(gpu_id=0)
     pipe.set_progress_bar_config(disable=True)
 
     num_layers = len(pipe.transformer.transformer_blocks)
