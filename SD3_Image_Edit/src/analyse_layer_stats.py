@@ -80,15 +80,15 @@ class StatsCollector:
 
                         # === Point 2: After QKV projection (KV) ===
                         attn = block_ref.attn
-                        cond_k = attn.add_k_proj(norm_cond).float()
-                        uncond_k = attn.add_k_proj(norm_uncond).float()
-                        cond_v = attn.add_v_proj(norm_cond).float()
-                        uncond_v = attn.add_v_proj(norm_uncond).float()
+                        cond_k = attn.add_k_proj(norm_cond)
+                        uncond_k = attn.add_k_proj(norm_uncond)
+                        cond_v = attn.add_v_proj(norm_cond)
+                        uncond_v = attn.add_v_proj(norm_uncond)
 
-                        dk = (cond_k - uncond_k).norm().item()
-                        ck = cond_k.norm().item()
-                        dv = (cond_v - uncond_v).norm().item()
-                        cv = cond_v.norm().item()
+                        dk = (cond_k.float() - uncond_k.float()).norm().item()
+                        ck = cond_k.float().norm().item()
+                        dv = (cond_v.float() - uncond_v.float()).norm().item()
+                        cv = cond_v.float().norm().item()
                         self.stats['kv'][idx].append({
                             'cond_k_norm': ck,
                             'uncond_k_norm': uncond_k.norm().item(),
@@ -113,11 +113,11 @@ class StatsCollector:
                         img_v = attn.to_v(norm_hidden).view(B, -1, H, head_dim).transpose(1, 2)
 
                         c_q = attn.add_q_proj(norm_cond).view(B, -1, H, head_dim).transpose(1, 2)
-                        c_k_h = cond_k.view(B, -1, H, head_dim).transpose(1, 2)
+                        c_k_h = cond_k.view(B, -1, H, head_dim).transpose(1, 2)  # bfloat16
                         c_v_h = cond_v.view(B, -1, H, head_dim).transpose(1, 2)
                         u_k_h = uncond_k.view(B, -1, H, head_dim).transpose(1, 2)
                         u_v_h = uncond_v.view(B, -1, H, head_dim).transpose(1, 2)
-                        u_q = attn.add_q_proj(norm_uncond).view(B, -1, H, head_dim).transpose(1, 2)
+                        u_q = attn.add_q_proj(norm_uncond).view(B, -1, H, head_dim).transpose(1, 2)  # bfloat16
 
                         img_len = img_q.shape[2]
 
