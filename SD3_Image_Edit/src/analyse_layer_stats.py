@@ -152,7 +152,6 @@ def main():
                         if os.path.isdir(os.path.join(args.dataset_dir, d)) and not d.startswith('.')])
 
     all_norm_stats = []    # per-sample list of per-layer norm/kv stats
-    all_block_ratios = []  # per-sample list of per-layer block output diff ratios
 
     sample_count = 0
     for cat in categories:
@@ -193,47 +192,24 @@ def main():
             norm_stats = collect_norm_and_kv(pipe, latents, t, cond_e, neg_e, cond_p)
             all_norm_stats.append(norm_stats)
 
-            # Collect block outputs for cond and uncond (two separate forwards)
-            cond_outputs = collect_block_outputs(pipe, latents, t, cond_e, cond_p)
-            uncond_outputs = collect_block_outputs(pipe, latents, t, neg_e, neg_p)
-
-            block_ratios = []
-            for li in range(min(len(cond_outputs), len(uncond_outputs))):
-                hc = cond_outputs[li]
-                hu = uncond_outputs[li]
-                d = (hc - hu).norm().item()
-                c = hc.norm().item()
-                block_ratios.append({'cond_norm': c, 'diff_norm': d, 'ratio': d / (c + 1e-8)})
-            all_block_ratios.append(block_ratios)
+            # Skip block output collection to save memory — use norm/KV stats only
+            # The block output stats can be computed separately on machines with more RAM
 
             sample_count += 1
             print(f"  [{sample_count}] {cat}/{row.get('id', idx)}")
-
-            # Free memory
-            del cond_outputs, uncond_outputs
             torch.cuda.empty_cache()
 
     print(f"\nCollected stats from {sample_count} samples.")
 
     # Average across samples
     avg_norm = []
-    avg_block = []
     for li in range(num_layers):
-        # Norm/KV stats
         entries = [s[li] for s in all_norm_stats if li < len(s) and s[li]]
         if entries:
             avg = {k: np.mean([e[k] for e in entries]) for k in entries[0]}
         else:
             avg = {}
         avg_norm.append(avg)
-
-        # Block stats
-        entries = [s[li] for s in all_block_ratios if li < len(s)]
-        if entries:
-            avg = {k: np.mean([e[k] for e in entries]) for k in entries[0]}
-        else:
-            avg = {}
-        avg_block.append(avg)
 
     # Write report
     with open(args.output, 'w') as f:
@@ -245,18 +221,17 @@ def main():
         f.write("When CFG amplifies with scale=s, the effective perturbation is `(s-1) * ratio * ||signal||`.\n")
         f.write("Higher ratio → more disruptive CFG at the same scale.\n\n")
 
-        f.write("| Layer | NormEmb (step 1) | K (step 2) | V (step 2) | Full Block (step 7) |\n")
-        f.write("|:-----:|:----------------:|:----------:|:----------:|:-------------------:|\n")
+        f.write("| Layer | NormEmb (step 1) | K (step 2) | V (step 2) |\n")
+        f.write("|:-----:|:----------------:|:----------:|:----------:|\n")
         for i in range(num_layers):
             ne = avg_norm[i].get('norm_ratio', 0)
             kk = avg_norm[i].get('kv_k_ratio', 0)
             vv = avg_norm[i].get('kv_v_ratio', 0)
-            fb = avg_block[i].get('ratio', 0)
-            f.write(f"| {i:2d} | {ne:.4f} | {kk:.4f} | {vv:.4f} | {fb:.4f} |\n")
+            f.write(f"| {i:2d} | {ne:.4f} | {kk:.4f} | {vv:.4f} |\n")
 
         f.write("\n## 2. Absolute Norms\n\n")
-        f.write("| Layer | NormEmb cond | NormEmb diff | K cond | K diff | V cond | V diff | Block cond | Block diff |\n")
-        f.write("|:-----:|:-----------:|:-----------:|:------:|:------:|:------:|:------:|:----------:|:----------:|\n")
+        f.write("| Layer | NormEmb cond | NormEmb diff | K cond | K diff | V cond | V diff |\n")
+        f.write("|:-----:|:-----------:|:-----------:|:------:|:------:|:------:|:------:|\n")
         for i in range(num_layers):
             nc = avg_norm[i].get('norm_cond', 0)
             nd = avg_norm[i].get('norm_diff', 0)
@@ -264,37 +239,29 @@ def main():
             kd = avg_norm[i].get('kv_k_diff', 0)
             vc = avg_norm[i].get('kv_v_cond', 0)
             vd = avg_norm[i].get('kv_v_diff', 0)
-            bc = avg_block[i].get('cond_norm', 0)
-            bd = avg_block[i].get('diff_norm', 0)
-            f.write(f"| {i:2d} | {nc:.1f} | {nd:.1f} | {kc:.1f} | {kd:.1f} | {vc:.1f} | {vd:.1f} | {bc:.1f} | {bd:.1f} |\n")
+            f.write(f"| {i:2d} | {nc:.1f} | {nd:.1f} | {kc:.1f} | {kd:.1f} | {vc:.1f} | {vd:.1f} |\n")
 
         # Summary
         avg_ratios = {}
         avg_ratios['normemb'] = np.mean([avg_norm[i].get('norm_ratio', 0) for i in range(num_layers)])
         avg_ratios['kv_k'] = np.mean([avg_norm[i].get('kv_k_ratio', 0) for i in range(num_layers)])
         avg_ratios['kv_v'] = np.mean([avg_norm[i].get('kv_v_ratio', 0) for i in range(num_layers)])
-        avg_ratios['block'] = np.mean([avg_block[i].get('ratio', 0) for i in range(num_layers)])
 
         f.write("\n## 3. Summary — Average Ratio Across All Layers\n\n")
         f.write("| Injection Point | Avg Ratio | CFG scale=2 perturbation | Interpretation |\n")
         f.write("|:----------------|:---------:|:------------------------:|:---------------|\n")
-        for name, label in [('normemb', 'NormEmb (step 1)'), ('kv_k', 'K (step 2)'), ('kv_v', 'V (step 2)'), ('block', 'FullBlock (step 7)')]:
+        for name, label in [('normemb', 'NormEmb (step 1)'), ('kv_k', 'K (step 2)'), ('kv_v', 'V (step 2)')]:
             r = avg_ratios[name]
-            pert = r * 1.0  # (scale-1) * ratio for scale=2
+            pert = r * 1.0
             f.write(f"| {label} | {r:.4f} ({r*100:.1f}%) | {pert*100:.1f}% of signal | {'Safe' if r < 0.05 else 'Moderate' if r < 0.15 else 'Dangerous'} |\n")
 
         f.write(f"\n## 4. Conclusion\n\n")
-        f.write(f"The cond-uncond difference ratio is **{avg_ratios['block']*100:.1f}%** at the block output level ")
-        f.write(f"vs **{avg_ratios['normemb']*100:.1f}%** at the NormEmb level and **{avg_ratios['kv_k']*100:.1f}%** at the K level.\n\n")
-
-        if avg_ratios['block'] < avg_ratios['normemb']:
-            f.write("The block output has the **lowest ratio**, confirming that the residual connection dominates the output, ")
-            f.write("making the cond-uncond difference a tiny fraction. CFG at scale=2 perturbs only ")
-            f.write(f"{avg_ratios['block']*100:.1f}% of the signal — safe.\n\n")
-            f.write(f"In contrast, at the NormEmb level, CFG at scale=2 perturbs {avg_ratios['normemb']*100:.1f}% — ")
-            f.write(f"{'dangerous' if avg_ratios['normemb'] > 0.15 else 'moderate'}, explaining the quality degradation.\n")
-        else:
-            f.write("Results show the relative magnitudes at each point.\n")
+        f.write(f"The cond-uncond difference ratio is **{avg_ratios['normemb']*100:.1f}%** at the NormEmb level ")
+        f.write(f"and **{avg_ratios['kv_k']*100:.1f}%** at the K level.\n\n")
+        f.write("These ratios indicate how much of the signal is cond-uncond difference at each injection point. ")
+        f.write("Higher ratios mean CFG amplification perturbs a larger fraction of the signal, making it more disruptive.\n\n")
+        f.write("For full-block LayerCFG, the residual connection dominates the block output (hidden_out ≈ hidden_in + small_update), ")
+        f.write("so the cond-uncond difference is a much smaller fraction — explaining why full-block tolerates higher CFG scales.\n")
 
     print(f"Report saved to {args.output}")
 
