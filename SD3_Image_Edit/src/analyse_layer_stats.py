@@ -71,6 +71,11 @@ def collect_norm_and_kv(pipe, latents, timestep, enc_cond, enc_uncond, pooled):
                     stats_per_layer.append({})
                     return output
 
+                # Ensure all on same device
+                dev = temb.device
+                enc_uncond_in = enc_uncond_in.to(dev)
+                _enc_uncond_state[0] = _enc_uncond_state[0].to(dev)
+
                 with torch.no_grad():
                     # NormEmb stats
                     if block_ref.context_pre_only:
