@@ -54,9 +54,8 @@ def collect_norm_and_kv(pipe, latents, timestep, enc_cond, enc_uncond, pooled):
     transformer = pipe.transformer
     stats_per_layer = []
 
-    # Project uncond through context_embedder (ensure same device)
-    ctx_device = next(transformer.context_embedder.parameters()).device
-    enc_uncond_proj = transformer.context_embedder(enc_uncond.to(ctx_device))
+    # Project uncond through context_embedder
+    enc_uncond_proj = transformer.context_embedder(enc_uncond)
     _enc_uncond_state = [enc_uncond_proj.clone()]
 
     hooks = []
@@ -70,11 +69,6 @@ def collect_norm_and_kv(pipe, latents, timestep, enc_cond, enc_uncond, pooled):
                 if enc_cond_in is None or temb is None:
                     stats_per_layer.append({})
                     return output
-
-                # Ensure all on same device
-                dev = temb.device
-                enc_uncond_in = enc_uncond_in.to(dev)
-                _enc_uncond_state[0] = _enc_uncond_state[0].to(dev)
 
                 with torch.no_grad():
                     # NormEmb stats
@@ -144,7 +138,7 @@ def main():
     device = torch.device("cuda")
     print("Loading pipeline...")
     pipe = StableDiffusion3Img2ImgPipeline.from_pretrained(args.model_id, torch_dtype=torch.bfloat16)
-    pipe.enable_model_cpu_offload(gpu_id=0)
+    pipe = pipe.to(device)
     pipe.set_progress_bar_config(disable=True)
 
     num_layers = len(pipe.transformer.transformer_blocks)
