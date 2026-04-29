@@ -54,8 +54,9 @@ def collect_norm_and_kv(pipe, latents, timestep, enc_cond, enc_uncond, pooled):
     transformer = pipe.transformer
     stats_per_layer = []
 
-    # Project uncond through context_embedder
-    enc_uncond_proj = transformer.context_embedder(enc_uncond)
+    # Project uncond through context_embedder (ensure same device)
+    ctx_device = next(transformer.context_embedder.parameters()).device
+    enc_uncond_proj = transformer.context_embedder(enc_uncond.to(ctx_device))
     _enc_uncond_state = [enc_uncond_proj.clone()]
 
     hooks = []
