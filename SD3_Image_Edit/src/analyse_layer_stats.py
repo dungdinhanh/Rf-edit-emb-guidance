@@ -1,13 +1,16 @@
 """
-Statistical analysis of signals at each guidance injection point.
+Statistical analysis of cond-uncond difference at each injection point.
 
-For 100 PIE-Bench samples, measure the norm, variance, and cond-uncond
-difference ratio at each of the 4 injection points across all 24 blocks.
+Runs model forward FOUR times per sample:
+1. Standard cond forward — collect hidden states at each block output
+2. Standard uncond forward — collect hidden states at each block output
+3. Both norms and QKV stats collected via pre-hooks (lightweight)
+
+This avoids the infinite-recursion problem by not calling blocks inside hooks.
 """
 
 import os, sys, io, json
 import torch
-import torch.nn.functional as F
 import numpy as np
 import pandas as pd
 from PIL import Image
@@ -16,191 +19,111 @@ from diffusers import StableDiffusion3Img2ImgPipeline
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', '..'))
 
 
-class StatsCollector:
-    """Hooks into blocks to collect statistics at each injection point."""
+def collect_block_outputs(pipe, latents, timestep, enc, pooled):
+    """Run full forward and collect hidden_states after each block."""
+    transformer = pipe.transformer
+    block_outputs = []
 
-    def __init__(self, pipe, cond_embeds, neg_embeds, cond_pooled):
-        self.pipe = pipe
-        self.transformer = pipe.transformer
-        self.cond_embeds = cond_embeds
-        self.neg_embeds = neg_embeds
-        self.cond_pooled = cond_pooled
+    # Hook each block to capture output
+    hooks = []
+    for i, block in enumerate(transformer.transformer_blocks):
+        def make_hook(idx):
+            def hook(module, args, kwargs, output):
+                if isinstance(output, tuple) and len(output) == 2:
+                    enc_out, hidden_out = output
+                    block_outputs.append(hidden_out.detach().float())
+                return output
+            return hook
+        h = block.register_forward_hook(make_hook(i), with_kwargs=True)
+        hooks.append(h)
 
-        # Project uncond
-        self.enc_uncond = self.transformer.context_embedder(neg_embeds)
+    with torch.no_grad():
+        transformer(
+            hidden_states=latents, timestep=timestep,
+            encoder_hidden_states=enc, pooled_projections=pooled,
+            return_dict=False)
 
-        self.num_layers = len(self.transformer.transformer_blocks)
-        self.hooks = []
+    for h in hooks:
+        h.remove()
 
-        # Storage: per-layer stats
-        # Each entry: {norm_cond, norm_uncond, norm_diff, ratio_diff_to_signal, ...}
-        self.stats = {
-            'normemb': [[] for _ in range(self.num_layers)],   # After LayerNorm (step 1)
-            'kv': [[] for _ in range(self.num_layers)],        # After QKV proj (step 2)
-            'atten': [[] for _ in range(self.num_layers)],     # After attention (step 4)
-            'fullblock': [[] for _ in range(self.num_layers)],  # After full block (step 7)
-        }
+    return block_outputs
 
-    def install(self):
-        """Install hooks on all blocks."""
-        for i, block in enumerate(self.transformer.transformer_blocks):
-            def make_hook(block_ref, idx):
-                def hook(module, args, kwargs, output):
-                    temb = kwargs.get('temb', None)
-                    enc_cond_input = kwargs.get('encoder_hidden_states', None)
-                    hidden_input = kwargs.get('hidden_states', None)
 
-                    if enc_cond_input is None or temb is None or hidden_input is None:
-                        return output
+def collect_norm_and_kv(pipe, latents, timestep, enc_cond, enc_uncond, pooled):
+    """Run cond forward and collect norm_txt and K/V for both cond and uncond at each block."""
+    transformer = pipe.transformer
+    stats_per_layer = []
 
-                    enc_uncond = self.enc_uncond
+    # Project uncond through context_embedder
+    enc_uncond_proj = transformer.context_embedder(enc_uncond)
+    _enc_uncond_state = [enc_uncond_proj.clone()]
 
-                    with torch.no_grad():
-                        # === Point 1: After LayerNorm (NormEmb) ===
-                        if block_ref.context_pre_only:
-                            norm_cond = block_ref.norm1_context(enc_cond_input, temb)
-                            norm_uncond = block_ref.norm1_context(enc_uncond, temb)
-                        else:
-                            norm_cond, c_gate, c_shift, c_scale, c_gate_mlp = block_ref.norm1_context(enc_cond_input, emb=temb)
-                            norm_uncond, u_gate, u_shift, u_scale, u_gate_mlp = block_ref.norm1_context(enc_uncond, emb=temb)
+    hooks = []
+    for i, block in enumerate(transformer.transformer_blocks):
+        def make_hook(block_ref, idx):
+            def hook(module, args, kwargs, output):
+                temb = kwargs.get('temb', None)
+                enc_cond_in = kwargs.get('encoder_hidden_states', None)
+                enc_uncond_in = _enc_uncond_state[0]
 
-                        nc = norm_cond.float()
-                        nu = norm_uncond.float()
-                        diff_norm = (nc - nu).norm().item()
-                        cond_norm = nc.norm().item()
-                        uncond_norm = nu.norm().item()
-                        self.stats['normemb'][idx].append({
-                            'cond_norm': cond_norm,
-                            'uncond_norm': uncond_norm,
-                            'diff_norm': diff_norm,
-                            'ratio': diff_norm / (cond_norm + 1e-8),
-                            'cond_std': nc.std().item(),
-                            'uncond_std': nu.std().item(),
-                        })
-
-                        # === Point 2: After QKV projection (KV) ===
-                        attn = block_ref.attn
-                        cond_k = attn.add_k_proj(norm_cond)
-                        uncond_k = attn.add_k_proj(norm_uncond)
-                        cond_v = attn.add_v_proj(norm_cond)
-                        uncond_v = attn.add_v_proj(norm_uncond)
-
-                        dk = (cond_k.float() - uncond_k.float()).norm().item()
-                        ck = cond_k.float().norm().item()
-                        dv = (cond_v.float() - uncond_v.float()).norm().item()
-                        cv = cond_v.float().norm().item()
-                        self.stats['kv'][idx].append({
-                            'cond_k_norm': ck,
-                            'uncond_k_norm': uncond_k.norm().item(),
-                            'diff_k_norm': dk,
-                            'ratio_k': dk / (ck + 1e-8),
-                            'cond_v_norm': cv,
-                            'diff_v_norm': dv,
-                            'ratio_v': dv / (cv + 1e-8),
-                        })
-
-                        # === Point 3: After attention (AttenCFG) ===
-                        # Need to run attention twice
-                        norm_hidden, gate_msa, shift_mlp, scale_mlp, gate_mlp = block_ref.norm1(hidden_input, emb=temb)
-
-                        inner_dim = attn.to_q.out_features
-                        head_dim = inner_dim // attn.heads
-                        H = attn.heads
-                        B = hidden_input.shape[0]
-
-                        img_q = attn.to_q(norm_hidden).view(B, -1, H, head_dim).transpose(1, 2)
-                        img_k = attn.to_k(norm_hidden).view(B, -1, H, head_dim).transpose(1, 2)
-                        img_v = attn.to_v(norm_hidden).view(B, -1, H, head_dim).transpose(1, 2)
-
-                        c_q = attn.add_q_proj(norm_cond).view(B, -1, H, head_dim).transpose(1, 2)
-                        c_k_h = cond_k.view(B, -1, H, head_dim).transpose(1, 2)  # bfloat16
-                        c_v_h = cond_v.view(B, -1, H, head_dim).transpose(1, 2)
-                        u_k_h = uncond_k.view(B, -1, H, head_dim).transpose(1, 2)
-                        u_v_h = uncond_v.view(B, -1, H, head_dim).transpose(1, 2)
-                        u_q = attn.add_q_proj(norm_uncond).view(B, -1, H, head_dim).transpose(1, 2)  # bfloat16
-
-                        img_len = img_q.shape[2]
-
-                        # Cond attention
-                        q_c = torch.cat([img_q, c_q], dim=2)
-                        k_c = torch.cat([img_k, c_k_h], dim=2)
-                        v_c = torch.cat([img_v, c_v_h], dim=2)
-                        attn_c = F.scaled_dot_product_attention(q_c, k_c, v_c)
-                        img_attn_c = attn_c[:, :, :img_len, :].float()
-
-                        # Uncond attention
-                        q_u = torch.cat([img_q, u_q], dim=2)
-                        k_u = torch.cat([img_k, u_k_h], dim=2)
-                        v_u = torch.cat([img_v, u_v_h], dim=2)
-                        attn_u = F.scaled_dot_product_attention(q_u, k_u, v_u)
-                        img_attn_u = attn_u[:, :, :img_len, :].float()
-
-                        da = (img_attn_c - img_attn_u).norm().item()
-                        ca = img_attn_c.norm().item()
-                        self.stats['atten'][idx].append({
-                            'cond_attn_norm': ca,
-                            'uncond_attn_norm': img_attn_u.norm().item(),
-                            'diff_attn_norm': da,
-                            'ratio': da / (ca + 1e-8),
-                            'cond_attn_std': img_attn_c.std().item(),
-                        })
-
-                        # === Point 4: After full block (FullBlock) ===
-                        # output = (enc_out, hidden_out) for the cond path
-                        if isinstance(output, tuple) and len(output) == 2:
-                            enc_out_cond, hidden_out_cond = output
-                            # Run uncond path
-                            enc_out_uncond, hidden_out_uncond = block_ref(
-                                hidden_states=hidden_input,
-                                encoder_hidden_states=enc_uncond,
-                                temb=temb,
-                            )
-                            hc = hidden_out_cond.float()
-                            hu = hidden_out_uncond.float()
-                            dh = (hc - hu).norm().item()
-                            ch = hc.norm().item()
-                            self.stats['fullblock'][idx].append({
-                                'cond_hidden_norm': ch,
-                                'uncond_hidden_norm': hu.norm().item(),
-                                'diff_hidden_norm': dh,
-                                'ratio': dh / (ch + 1e-8),
-                                'hidden_std': hc.std().item(),
-                            })
-
-                    # Evolve uncond through FF (approximate)
-                    if not block_ref.context_pre_only:
-                        with torch.no_grad():
-                            norm_uf = block_ref.norm2_context(self.enc_uncond)
-                            norm_uf = norm_uf * (1 + u_scale[:, None]) + u_shift[:, None]
-                            uf = block_ref.ff_context(norm_uf)
-                            self.enc_uncond = self.enc_uncond + u_gate_mlp.unsqueeze(1) * uf
-
+                if enc_cond_in is None or temb is None:
+                    stats_per_layer.append({})
                     return output
-                return hook
 
-            h = block.register_forward_hook(make_hook(block, i), with_kwargs=True)
-            self.hooks.append(h)
+                with torch.no_grad():
+                    # NormEmb stats
+                    if block_ref.context_pre_only:
+                        nc = block_ref.norm1_context(enc_cond_in, temb).float()
+                        nu = block_ref.norm1_context(enc_uncond_in, temb).float()
+                    else:
+                        nc, c_gate, c_shift, c_scale, c_gate_mlp = block_ref.norm1_context(enc_cond_in, emb=temb)
+                        nu, u_gate, u_shift, u_scale, u_gate_mlp = block_ref.norm1_context(enc_uncond_in, emb=temb)
+                        nc = nc.float()
+                        nu = nu.float()
 
-    def uninstall(self):
-        for h in self.hooks:
-            h.remove()
-        self.hooks = []
+                    # KV stats
+                    attn = block_ref.attn
+                    ck = attn.add_k_proj(nc.to(enc_cond_in.dtype)).float()
+                    uk = attn.add_k_proj(nu.to(enc_uncond_in.dtype)).float()
+                    cv = attn.add_v_proj(nc.to(enc_cond_in.dtype)).float()
+                    uv = attn.add_v_proj(nu.to(enc_uncond_in.dtype)).float()
 
-    def get_summary(self):
-        """Compute mean statistics across all samples."""
-        summary = {}
-        for point_name in ['normemb', 'kv', 'atten', 'fullblock']:
-            summary[point_name] = []
-            for layer_idx in range(self.num_layers):
-                entries = self.stats[point_name][layer_idx]
-                if not entries:
-                    summary[point_name].append({})
-                    continue
-                avg = {}
-                for key in entries[0].keys():
-                    avg[key] = np.mean([e[key] for e in entries])
-                summary[point_name].append(avg)
-        return summary
+                    stats_per_layer.append({
+                        'norm_cond': nc.norm().item(),
+                        'norm_uncond': nu.norm().item(),
+                        'norm_diff': (nc - nu).norm().item(),
+                        'norm_ratio': (nc - nu).norm().item() / (nc.norm().item() + 1e-8),
+                        'kv_k_cond': ck.norm().item(),
+                        'kv_k_diff': (ck - uk).norm().item(),
+                        'kv_k_ratio': (ck - uk).norm().item() / (ck.norm().item() + 1e-8),
+                        'kv_v_cond': cv.norm().item(),
+                        'kv_v_diff': (cv - uv).norm().item(),
+                        'kv_v_ratio': (cv - uv).norm().item() / (cv.norm().item() + 1e-8),
+                    })
+
+                    # Evolve uncond through FF
+                    if not block_ref.context_pre_only:
+                        norm_uf = block_ref.norm2_context(enc_uncond_in)
+                        norm_uf = norm_uf * (1 + u_scale[:, None]) + u_shift[:, None]
+                        uf = block_ref.ff_context(norm_uf)
+                        _enc_uncond_state[0] = enc_uncond_in + u_gate_mlp.unsqueeze(1) * uf
+
+                return output
+            return hook
+
+        h = block.register_forward_hook(make_hook(block, i), with_kwargs=True)
+        hooks.append(h)
+
+    with torch.no_grad():
+        transformer(
+            hidden_states=latents, timestep=timestep,
+            encoder_hidden_states=enc_cond, pooled_projections=pooled,
+            return_dict=False)
+
+    for h in hooks:
+        h.remove()
+
+    return stats_per_layer
 
 
 def main():
@@ -218,18 +141,17 @@ def main():
     pipe = pipe.to(device)
     pipe.set_progress_bar_config(disable=True)
 
-    dataset_dir = args.dataset_dir
-    categories = sorted([d for d in os.listdir(dataset_dir)
-                        if os.path.isdir(os.path.join(dataset_dir, d)) and not d.startswith('.')])
+    num_layers = len(pipe.transformer.transformer_blocks)
+    categories = sorted([d for d in os.listdir(args.dataset_dir)
+                        if os.path.isdir(os.path.join(args.dataset_dir, d)) and not d.startswith('.')])
 
-    # Collect stats across samples
-    all_summaries = []
+    all_norm_stats = []    # per-sample list of per-layer norm/kv stats
+    all_block_ratios = []  # per-sample list of per-layer block output diff ratios
+
     sample_count = 0
-
     for cat in categories:
-        pq_path = os.path.join(dataset_dir, cat, "V1-00000-of-00001.parquet")
-        if not os.path.exists(pq_path):
-            continue
+        pq_path = os.path.join(args.dataset_dir, cat, "V1-00000-of-00001.parquet")
+        if not os.path.exists(pq_path): continue
         df = pd.read_parquet(pq_path)
         n = min(len(df), args.max_samples)
 
@@ -237,124 +159,136 @@ def main():
             row = df.iloc[idx]
             target_prompt = row['target_prompt'].replace('[', '').replace(']', '')
             img_data = row['image']
-            if isinstance(img_data, dict) and 'bytes' in img_data:
-                source_img = Image.open(io.BytesIO(img_data['bytes']))
-            else:
-                continue
+            if not (isinstance(img_data, dict) and 'bytes' in img_data): continue
+            source_img = Image.open(io.BytesIO(img_data['bytes']))
 
             w, h = source_img.size
             w, h = w - w % 16, h - h % 16
             source_img = source_img.resize((w, h))
 
-            # Encode
-            (cond_embeds, neg_embeds, cond_pooled, neg_pooled) = pipe.encode_prompt(
+            (cond_e, neg_e, cond_p, neg_p) = pipe.encode_prompt(
                 prompt=target_prompt, prompt_2=target_prompt, prompt_3=target_prompt,
                 negative_prompt="", negative_prompt_2="", negative_prompt_3="",
                 do_classifier_free_guidance=True, device=device)
 
-            # Encode image + add noise
             image_tensor = pipe.image_processor.preprocess(source_img)
             image_tensor = image_tensor.to(device=device, dtype=pipe.vae.dtype)
             latents = pipe.vae.encode(image_tensor).latent_dist.sample()
             latents = (latents - pipe.vae.config.shift_factor) * pipe.vae.config.scaling_factor
-            latents = latents.to(dtype=cond_embeds.dtype)
+            latents = latents.to(dtype=cond_e.dtype)
 
             pipe.scheduler.set_timesteps(25, device=device)
             timesteps, _ = pipe.get_timesteps(25, 0.7, device)
             noise = torch.randn_like(latents)
             latents = pipe.scheduler.scale_noise(latents, timesteps[:1], noise)
+            t = timesteps[len(timesteps) // 2].unsqueeze(0)
 
-            # Pick middle timestep
-            t_idx = len(timesteps) // 2
-            t = timesteps[t_idx]
+            # Collect norm and KV stats (single forward with hooks)
+            norm_stats = collect_norm_and_kv(pipe, latents, t, cond_e, neg_e, cond_p)
+            all_norm_stats.append(norm_stats)
 
-            collector = StatsCollector(pipe, cond_embeds, neg_embeds, cond_pooled)
-            collector.install()
+            # Collect block outputs for cond and uncond (two separate forwards)
+            cond_outputs = collect_block_outputs(pipe, latents, t, cond_e, cond_p)
+            uncond_outputs = collect_block_outputs(pipe, latents, t, neg_e, neg_p)
 
-            # Run one forward pass (cond path)
-            with torch.no_grad():
-                pipe.transformer(
-                    hidden_states=latents,
-                    timestep=t.unsqueeze(0),
-                    encoder_hidden_states=cond_embeds,
-                    pooled_projections=cond_pooled,
-                    return_dict=False,
-                )
+            block_ratios = []
+            for li in range(min(len(cond_outputs), len(uncond_outputs))):
+                hc = cond_outputs[li]
+                hu = uncond_outputs[li]
+                d = (hc - hu).norm().item()
+                c = hc.norm().item()
+                block_ratios.append({'cond_norm': c, 'diff_norm': d, 'ratio': d / (c + 1e-8)})
+            all_block_ratios.append(block_ratios)
 
-            collector.uninstall()
-            all_summaries.append(collector.get_summary())
             sample_count += 1
             print(f"  [{sample_count}] {cat}/{row.get('id', idx)}")
 
+            # Free memory
+            del cond_outputs, uncond_outputs
+            torch.cuda.empty_cache()
+
     print(f"\nCollected stats from {sample_count} samples.")
 
-    # Average across all samples
-    num_layers = len(pipe.transformer.transformer_blocks)
-    final = {}
-    for point in ['normemb', 'kv', 'atten', 'fullblock']:
-        final[point] = []
-        for layer_idx in range(num_layers):
-            layer_entries = [s[point][layer_idx] for s in all_summaries if s[point][layer_idx]]
-            if not layer_entries:
-                final[point].append({})
-                continue
+    # Average across samples
+    avg_norm = []
+    avg_block = []
+    for li in range(num_layers):
+        # Norm/KV stats
+        entries = [s[li] for s in all_norm_stats if li < len(s) and s[li]]
+        if entries:
+            avg = {k: np.mean([e[k] for e in entries]) for k in entries[0]}
+        else:
             avg = {}
-            for key in layer_entries[0].keys():
-                avg[key] = np.mean([e[key] for e in layer_entries])
-            final[point].append(avg)
+        avg_norm.append(avg)
+
+        # Block stats
+        entries = [s[li] for s in all_block_ratios if li < len(s)]
+        if entries:
+            avg = {k: np.mean([e[k] for e in entries]) for k in entries[0]}
+        else:
+            avg = {}
+        avg_block.append(avg)
 
     # Write report
     with open(args.output, 'w') as f:
-        f.write("# Per-Layer Signal Statistics — Empirical Analysis\n\n")
+        f.write(f"# Per-Layer Signal Statistics — Empirical Analysis\n\n")
         f.write(f"Averaged over {sample_count} samples from PIE-Bench++, middle timestep.\n\n")
 
-        f.write("## 1. Cond-Uncond Difference Ratio per Layer\n\n")
-        f.write("Ratio = ||cond - uncond|| / ||cond|| — measures how much of the signal is the guidance-relevant difference.\n\n")
-        f.write("Higher ratio means CFG amplification affects a larger fraction of the signal → more disruptive.\n\n")
+        f.write("## 1. Cond-Uncond Difference Ratio at Each Injection Point\n\n")
+        f.write("**Ratio = ||cond - uncond|| / ||cond||** — fraction of signal that is the cond-uncond difference.\n\n")
+        f.write("When CFG amplifies with scale=s, the effective perturbation is `(s-1) * ratio * ||signal||`.\n")
+        f.write("Higher ratio → more disruptive CFG at the same scale.\n\n")
 
-        f.write("| Layer | NormEmb (step 1) | KV-K (step 2) | KV-V (step 2) | Atten (step 4) | FullBlock (step 7) |\n")
-        f.write("|:-----:|:----------------:|:-------------:|:-------------:|:--------------:|:------------------:|\n")
+        f.write("| Layer | NormEmb (step 1) | K (step 2) | V (step 2) | Full Block (step 7) |\n")
+        f.write("|:-----:|:----------------:|:----------:|:----------:|:-------------------:|\n")
         for i in range(num_layers):
-            ne = final['normemb'][i].get('ratio', 0)
-            kvk = final['kv'][i].get('ratio_k', 0)
-            kvv = final['kv'][i].get('ratio_v', 0)
-            at = final['atten'][i].get('ratio', 0)
-            fb = final['fullblock'][i].get('ratio', 0)
-            f.write(f"| {i:2d} | {ne:.4f} | {kvk:.4f} | {kvv:.4f} | {at:.4f} | {fb:.4f} |\n")
+            ne = avg_norm[i].get('norm_ratio', 0)
+            kk = avg_norm[i].get('kv_k_ratio', 0)
+            vv = avg_norm[i].get('kv_v_ratio', 0)
+            fb = avg_block[i].get('ratio', 0)
+            f.write(f"| {i:2d} | {ne:.4f} | {kk:.4f} | {vv:.4f} | {fb:.4f} |\n")
 
-        f.write("\n## 2. Absolute Norms per Layer\n\n")
-        f.write("| Layer | NormEmb cond | NormEmb diff | KV-K cond | KV-K diff | Atten cond | Atten diff | Block cond | Block diff |\n")
-        f.write("|:-----:|:----------:|:----------:|:--------:|:--------:|:---------:|:---------:|:---------:|:---------:|\n")
+        f.write("\n## 2. Absolute Norms\n\n")
+        f.write("| Layer | NormEmb cond | NormEmb diff | K cond | K diff | V cond | V diff | Block cond | Block diff |\n")
+        f.write("|:-----:|:-----------:|:-----------:|:------:|:------:|:------:|:------:|:----------:|:----------:|\n")
         for i in range(num_layers):
-            ne_c = final['normemb'][i].get('cond_norm', 0)
-            ne_d = final['normemb'][i].get('diff_norm', 0)
-            kk_c = final['kv'][i].get('cond_k_norm', 0)
-            kk_d = final['kv'][i].get('diff_k_norm', 0)
-            at_c = final['atten'][i].get('cond_attn_norm', 0)
-            at_d = final['atten'][i].get('diff_attn_norm', 0)
-            fb_c = final['fullblock'][i].get('cond_hidden_norm', 0)
-            fb_d = final['fullblock'][i].get('diff_hidden_norm', 0)
-            f.write(f"| {i:2d} | {ne_c:.1f} | {ne_d:.1f} | {kk_c:.1f} | {kk_d:.1f} | {at_c:.1f} | {at_d:.1f} | {fb_c:.1f} | {fb_d:.1f} |\n")
+            nc = avg_norm[i].get('norm_cond', 0)
+            nd = avg_norm[i].get('norm_diff', 0)
+            kc = avg_norm[i].get('kv_k_cond', 0)
+            kd = avg_norm[i].get('kv_k_diff', 0)
+            vc = avg_norm[i].get('kv_v_cond', 0)
+            vd = avg_norm[i].get('kv_v_diff', 0)
+            bc = avg_block[i].get('cond_norm', 0)
+            bd = avg_block[i].get('diff_norm', 0)
+            f.write(f"| {i:2d} | {nc:.1f} | {nd:.1f} | {kc:.1f} | {kd:.1f} | {vc:.1f} | {vd:.1f} | {bc:.1f} | {bd:.1f} |\n")
 
-        f.write("\n## 3. Summary\n\n")
-
-        # Compute averages
+        # Summary
         avg_ratios = {}
-        for point in ['normemb', 'kv', 'atten', 'fullblock']:
-            if point == 'kv':
-                ratios = [final[point][i].get('ratio_k', 0) for i in range(num_layers) if final[point][i]]
-            else:
-                ratios = [final[point][i].get('ratio', 0) for i in range(num_layers) if final[point][i]]
-            avg_ratios[point] = np.mean(ratios) if ratios else 0
+        avg_ratios['normemb'] = np.mean([avg_norm[i].get('norm_ratio', 0) for i in range(num_layers)])
+        avg_ratios['kv_k'] = np.mean([avg_norm[i].get('kv_k_ratio', 0) for i in range(num_layers)])
+        avg_ratios['kv_v'] = np.mean([avg_norm[i].get('kv_v_ratio', 0) for i in range(num_layers)])
+        avg_ratios['block'] = np.mean([avg_block[i].get('ratio', 0) for i in range(num_layers)])
 
-        f.write("| Injection Point | Avg Diff/Signal Ratio | Implication |\n")
-        f.write("|:----------------|:--------------------:|:------------|\n")
-        f.write(f"| NormEmb (step 1) | {avg_ratios['normemb']:.4f} | {'High' if avg_ratios['normemb'] > 0.1 else 'Low'} — CFG affects {avg_ratios['normemb']*100:.1f}% of signal |\n")
-        f.write(f"| KV (step 2) | {avg_ratios['kv']:.4f} | {'High' if avg_ratios['kv'] > 0.1 else 'Low'} — CFG affects {avg_ratios['kv']*100:.1f}% of signal |\n")
-        f.write(f"| Atten (step 4) | {avg_ratios['atten']:.4f} | {'High' if avg_ratios['atten'] > 0.1 else 'Low'} — CFG affects {avg_ratios['atten']*100:.1f}% of signal |\n")
-        f.write(f"| FullBlock (step 7) | {avg_ratios['fullblock']:.4f} | {'High' if avg_ratios['fullblock'] > 0.1 else 'Low'} — CFG affects {avg_ratios['fullblock']*100:.1f}% of signal |\n")
+        f.write("\n## 3. Summary — Average Ratio Across All Layers\n\n")
+        f.write("| Injection Point | Avg Ratio | CFG scale=2 perturbation | Interpretation |\n")
+        f.write("|:----------------|:---------:|:------------------------:|:---------------|\n")
+        for name, label in [('normemb', 'NormEmb (step 1)'), ('kv_k', 'K (step 2)'), ('kv_v', 'V (step 2)'), ('block', 'FullBlock (step 7)')]:
+            r = avg_ratios[name]
+            pert = r * 1.0  # (scale-1) * ratio for scale=2
+            f.write(f"| {label} | {r:.4f} ({r*100:.1f}%) | {pert*100:.1f}% of signal | {'Safe' if r < 0.05 else 'Moderate' if r < 0.15 else 'Dangerous'} |\n")
 
-        f.write(f"\n**The lower the ratio, the safer the CFG amplification.** Full-block has the lowest ratio because the residual connection dominates the output, making the cond-uncond difference a tiny fraction of the total signal.\n")
+        f.write(f"\n## 4. Conclusion\n\n")
+        f.write(f"The cond-uncond difference ratio is **{avg_ratios['block']*100:.1f}%** at the block output level ")
+        f.write(f"vs **{avg_ratios['normemb']*100:.1f}%** at the NormEmb level and **{avg_ratios['kv_k']*100:.1f}%** at the K level.\n\n")
+
+        if avg_ratios['block'] < avg_ratios['normemb']:
+            f.write("The block output has the **lowest ratio**, confirming that the residual connection dominates the output, ")
+            f.write("making the cond-uncond difference a tiny fraction. CFG at scale=2 perturbs only ")
+            f.write(f"{avg_ratios['block']*100:.1f}% of the signal — safe.\n\n")
+            f.write(f"In contrast, at the NormEmb level, CFG at scale=2 perturbs {avg_ratios['normemb']*100:.1f}% — ")
+            f.write(f"{'dangerous' if avg_ratios['normemb'] > 0.15 else 'moderate'}, explaining the quality degradation.\n")
+        else:
+            f.write("Results show the relative magnitudes at each point.\n")
 
     print(f"Report saved to {args.output}")
 
