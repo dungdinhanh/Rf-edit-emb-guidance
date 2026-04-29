@@ -11,9 +11,14 @@ def main(args):
     if args.method == "atten":
         from sd3_edit_layer_atten_cfg import SD3LayerAttenCFGEditor
         editor = SD3LayerAttenCFGEditor(model_id=args.model_id, task=args.task)
-    else:
+    elif args.method == "embedd":
         from sd3_edit_layer_embedd_cfg import SD3LayerEmbeddCFGEditor
         editor = SD3LayerEmbeddCFGEditor(model_id=args.model_id, task=args.task)
+    elif args.method == "normemb":
+        from sd3_edit_layer_normemb_cfg import SD3LayerNormEmbCFGEditor
+        editor = SD3LayerNormEmbCFGEditor(model_id=args.model_id, task=args.task)
+    else:
+        raise ValueError(f"Unknown method: {args.method}")
 
     device = torch.device("cuda")
     dataset_dir = args.dataset_dir
@@ -79,7 +84,7 @@ def main(args):
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument('--model_id', default='stabilityai/stable-diffusion-3-medium-diffusers')
-    parser.add_argument('--method', choices=['atten', 'embedd'], required=True)
+    parser.add_argument('--method', choices=['atten', 'embedd', 'normemb'], required=True)
     parser.add_argument('--task', choices=['edit', 'gen'], required=True)
     parser.add_argument('--base_scale', type=float, default=5.0)
     parser.add_argument('--layer_schedule', default='peak_mid',
