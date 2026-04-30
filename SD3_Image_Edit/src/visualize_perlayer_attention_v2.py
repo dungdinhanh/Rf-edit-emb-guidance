@@ -184,9 +184,9 @@ def main():
         noise = torch.randn_like(latents_clean)
         latents = pipe.scheduler.scale_noise(latents_clean, t.unsqueeze(0), noise)
 
-        # Quick preview of noisy latent (no VAE decode to save memory)
-        noisy_img = latents_to_preview(latents, source_img.size)
-        noisy_img.save(os.path.join(args.output_dir, f"input_step{step_idx}_{step_name}.jpg"))
+        # Use source image for overlay — provides spatial context for attention patterns
+        # (attention grid is spatially aligned with source regardless of noise level)
+        overlay_img = source_img
 
         t_input = t.unsqueeze(0)
 
@@ -217,18 +217,18 @@ def main():
 
         for li in range(24):
             # Row 0: Cond attention overlaid on noisy input
-            overlay = overlay_heatmap(noisy_img, all_cond_spatial[li], vmin=0, vmax=attn_vmax)
+            overlay = overlay_heatmap(overlay_img, all_cond_spatial[li], vmin=0, vmax=attn_vmax)
             axes[0, li].imshow(overlay)
             axes[0, li].set_title(f"L{li}", fontsize=7)
             axes[0, li].axis('off')
 
             # Row 1: Uncond attention overlaid on noisy input
-            overlay = overlay_heatmap(noisy_img, all_uncond_spatial[li], vmin=0, vmax=attn_vmax)
+            overlay = overlay_heatmap(overlay_img, all_uncond_spatial[li], vmin=0, vmax=attn_vmax)
             axes[1, li].imshow(overlay)
             axes[1, li].axis('off')
 
             # Row 2: |Cond - Uncond| overlaid on noisy input
-            overlay = overlay_heatmap(noisy_img, all_diff_spatial[li], vmin=0, vmax=diff_vmax)
+            overlay = overlay_heatmap(overlay_img, all_diff_spatial[li], vmin=0, vmax=diff_vmax)
             axes[2, li].imshow(overlay)
             axes[2, li].axis('off')
 
