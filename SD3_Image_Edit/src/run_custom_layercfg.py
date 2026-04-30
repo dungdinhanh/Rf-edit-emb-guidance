@@ -67,7 +67,26 @@ def main():
     args = parser.parse_args()
 
     device = torch.device("cuda")
-    editor = SD3PureLayerCFGEditor(model_id=args.model_id, task=args.task)
+
+    # Load pipeline but keep text encoders on CPU to fit on 24GB
+    from diffusers import StableDiffusion3Img2ImgPipeline, StableDiffusion3Pipeline
+    print(f"Loading SD3 pipeline ({args.task})...")
+    if args.task == "edit":
+        pipe = StableDiffusion3Img2ImgPipeline.from_pretrained(args.model_id, torch_dtype=torch.bfloat16)
+    else:
+        pipe = StableDiffusion3Pipeline.from_pretrained(args.model_id, torch_dtype=torch.bfloat16)
+    # Only transformer + VAE on GPU
+    pipe.transformer.to(device)
+    pipe.vae.to(device)
+    pipe.set_progress_bar_config(disable=True)
+
+    # Create editor with the pre-loaded pipe
+    editor = SD3PureLayerCFGEditor.__new__(SD3PureLayerCFGEditor)
+    editor.device = device
+    editor.task = args.task
+    editor.pipe = pipe
+    editor.num_layers = len(pipe.transformer.transformer_blocks)
+    print(f"SD3 loaded. {editor.num_layers} layers. Text encoders on CPU.")
 
     base_scales = EDIT_OPTIMAL if args.task == "edit" else GEN_OPTIMAL
 
@@ -119,10 +138,25 @@ def main():
                     t0 = __import__('time').time()
                     dev = editor.pipe._execution_device
 
-                    (cond_e, neg_e, cond_p, neg_p) = editor.pipe.encode_prompt(
-                        prompt=target_prompt, prompt_2=target_prompt, prompt_3=target_prompt,
-                        negative_prompt="", negative_prompt_2="", negative_prompt_3="",
-                        do_classifier_free_guidance=True, device=dev)
+                    # Move text encoders to GPU temporarily for encoding
+                    if hasattr(editor.pipe, 'text_encoder') and next(editor.pipe.text_encoder.parameters()).device.type == 'cpu':
+                        editor.pipe.text_encoder.to(dev)
+                        editor.pipe.text_encoder_2.to(dev)
+                        if editor.pipe.text_encoder_3 is not None:
+                            editor.pipe.text_encoder_3.to(dev)
+
+                    with torch.no_grad():
+                        (cond_e, neg_e, cond_p, neg_p) = editor.pipe.encode_prompt(
+                            prompt=target_prompt, prompt_2=target_prompt, prompt_3=target_prompt,
+                            negative_prompt="", negative_prompt_2="", negative_prompt_3="",
+                            do_classifier_free_guidance=True, device=dev)
+
+                    # Move text encoders back to CPU
+                    editor.pipe.text_encoder.cpu()
+                    editor.pipe.text_encoder_2.cpu()
+                    if editor.pipe.text_encoder_3 is not None:
+                        editor.pipe.text_encoder_3.cpu()
+                    import gc; gc.collect(); torch.cuda.empty_cache()
 
                     if args.task == "edit":
                         w, h = source_img.size
