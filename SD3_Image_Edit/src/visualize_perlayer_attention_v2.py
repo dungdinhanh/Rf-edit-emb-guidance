@@ -165,11 +165,12 @@ def main():
     step_indices = [0, total_steps // 4, total_steps // 2, 3 * total_steps // 4, total_steps - 1]
     step_names = ["early", "early_mid", "mid", "late_mid", "late"]
 
+    @torch.no_grad()
     def decode_latents_to_image(pipe, latents):
         """Decode latents to PIL image for visualization."""
         lat = latents / pipe.vae.config.scaling_factor + pipe.vae.config.shift_factor
         img = pipe.vae.decode(lat, return_dict=False)[0]
-        return pipe.image_processor.postprocess(img, output_type="pil")[0]
+        return pipe.image_processor.postprocess(img.detach(), output_type="pil")[0]
 
     for si, (step_idx, step_name) in enumerate(zip(step_indices, step_names)):
         t = timesteps[step_idx]
