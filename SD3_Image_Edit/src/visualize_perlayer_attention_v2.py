@@ -272,11 +272,11 @@ def main():
             axes[0, col].set_title(f"L{li} Cond", fontsize=9)
             axes[0, col].axis('off')
 
-            axes[1, col].imshow(overlay_heatmap(noisy_img, us, vmin=0, vmax=attn_vmax))
+            axes[1, col].imshow(overlay_heatmap(overlay_img, us, vmin=0, vmax=attn_vmax))
             axes[1, col].set_title(f"L{li} Uncond", fontsize=9)
             axes[1, col].axis('off')
 
-            axes[2, col].imshow(overlay_heatmap(noisy_img, ds, vmin=0, vmax=diff_vmax))
+            axes[2, col].imshow(overlay_heatmap(overlay_img, ds, vmin=0, vmax=diff_vmax))
             axes[2, col].set_title(f"L{li} |Diff|", fontsize=9)
             axes[2, col].axis('off')
 
