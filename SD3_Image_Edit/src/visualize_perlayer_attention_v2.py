@@ -268,7 +268,7 @@ def main():
             us = all_uncond_spatial[li]
             ds = all_diff_spatial[li]
 
-            axes[0, col].imshow(overlay_heatmap(noisy_img, cs, vmin=0, vmax=attn_vmax))
+            axes[0, col].imshow(overlay_heatmap(overlay_img, cs, vmin=0, vmax=attn_vmax))
             axes[0, col].set_title(f"L{li} Cond", fontsize=9)
             axes[0, col].axis('off')
 
