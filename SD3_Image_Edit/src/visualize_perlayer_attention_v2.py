@@ -165,28 +165,46 @@ def main():
     step_indices = [0, total_steps // 4, total_steps // 2, 3 * total_steps // 4, total_steps - 1]
     step_names = ["early", "early_mid", "mid", "late_mid", "late"]
 
-    def latents_to_preview(latents, target_size):
-        """Quick preview of latents without VAE decode — just normalize and resize."""
-        lat = latents[0].detach().float().cpu()
-        # Take first 3 channels as RGB proxy
-        rgb = lat[:3]
-        rgb = (rgb - rgb.min()) / (rgb.max() - rgb.min() + 1e-8)
-        rgb = rgb.permute(1, 2, 0).numpy()
-        rgb = (rgb * 255).clip(0, 255).astype(np.uint8)
-        return Image.fromarray(rgb).resize(target_size, Image.BILINEAR)
+    # Run the actual denoising loop and save intermediate latents
+    print("Running denoising to collect intermediate latents...")
+    noise = torch.randn_like(latents_clean)
+    latents_noisy = pipe.scheduler.scale_noise(latents_clean, timesteps[:1], noise)
+    intermediate_latents = {}
+    current_latents = latents_noisy.clone()
+
+    for i, t in enumerate(timesteps):
+        if i in step_indices:
+            intermediate_latents[i] = current_latents.clone()
+        timestep = t.expand(current_latents.shape[0])
+        with torch.no_grad():
+            noise_pred = pipe.transformer(
+                hidden_states=current_latents, timestep=timestep,
+                encoder_hidden_states=cond_e, pooled_projections=cond_p,
+                return_dict=False)[0]
+        current_latents = pipe.scheduler.step(noise_pred, t, current_latents, return_dict=False)[0]
+
+    # Decode intermediate latents to images
+    print("Decoding intermediate latents...")
+    intermediate_images = {}
+    for step_idx in step_indices:
+        lat = intermediate_latents[step_idx]
+        lat_dec = lat / pipe.vae.config.scaling_factor + pipe.vae.config.shift_factor
+        with torch.no_grad():
+            img_dec = pipe.vae.decode(lat_dec, return_dict=False)[0]
+        decoded_img = pipe.image_processor.postprocess(img_dec.detach(), output_type="pil")[0]
+        intermediate_images[step_idx] = decoded_img
+        decoded_img.save(os.path.join(args.output_dir, f"input_step{step_idx}.jpg"))
 
     for si, (step_idx, step_name) in enumerate(zip(step_indices, step_names)):
         t = timesteps[step_idx]
         t_val = t.item()
         print(f"\n=== Step {step_idx} ({step_name}, t={t_val:.0f}) ===")
 
-        # Add noise at this timestep level
-        noise = torch.randn_like(latents_clean)
-        latents = pipe.scheduler.scale_noise(latents_clean, t.unsqueeze(0), noise)
+        # Use the actual intermediate latent for this step
+        latents = intermediate_latents[step_idx]
 
-        # Use source image for overlay — provides spatial context for attention patterns
-        # (attention grid is spatially aligned with source regardless of noise level)
-        overlay_img = source_img
+        # Overlay attention on the decoded intermediate image (what model actually sees)
+        overlay_img = intermediate_images[step_idx]
 
         t_input = t.unsqueeze(0)
 
@@ -273,12 +291,11 @@ def main():
     # === Summary figure: Diff magnitude across layers and timesteps ===
     print("\nPlotting summary heatmap...")
 
-    # Re-collect diff magnitudes for all steps and layers
+    # Re-collect diff magnitudes using the intermediate latents already captured
     diff_magnitudes = np.zeros((len(step_indices), 24))
     for si, step_idx in enumerate(step_indices):
         t = timesteps[step_idx]
-        noise = torch.randn_like(latents_clean)
-        latents = pipe.scheduler.scale_noise(latents_clean, t.unsqueeze(0), noise)
+        latents = intermediate_latents[step_idx]
         t_input = t.unsqueeze(0)
 
         attn_c = run_and_capture(pipe, latents, t_input, cond_e, cond_p, all_layers)
