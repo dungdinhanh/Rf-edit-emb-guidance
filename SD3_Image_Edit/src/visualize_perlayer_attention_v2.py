@@ -165,12 +165,15 @@ def main():
     step_indices = [0, total_steps // 4, total_steps // 2, 3 * total_steps // 4, total_steps - 1]
     step_names = ["early", "early_mid", "mid", "late_mid", "late"]
 
-    @torch.no_grad()
-    def decode_latents_to_image(pipe, latents):
-        """Decode latents to PIL image for visualization."""
-        lat = latents / pipe.vae.config.scaling_factor + pipe.vae.config.shift_factor
-        img = pipe.vae.decode(lat, return_dict=False)[0]
-        return pipe.image_processor.postprocess(img.detach(), output_type="pil")[0]
+    def latents_to_preview(latents, target_size):
+        """Quick preview of latents without VAE decode — just normalize and resize."""
+        lat = latents[0].detach().float().cpu()
+        # Take first 3 channels as RGB proxy
+        rgb = lat[:3]
+        rgb = (rgb - rgb.min()) / (rgb.max() - rgb.min() + 1e-8)
+        rgb = rgb.permute(1, 2, 0).numpy()
+        rgb = (rgb * 255).clip(0, 255).astype(np.uint8)
+        return Image.fromarray(rgb).resize(target_size, Image.BILINEAR)
 
     for si, (step_idx, step_name) in enumerate(zip(step_indices, step_names)):
         t = timesteps[step_idx]
@@ -181,8 +184,8 @@ def main():
         noise = torch.randn_like(latents_clean)
         latents = pipe.scheduler.scale_noise(latents_clean, t.unsqueeze(0), noise)
 
-        # Decode the noisy latent to get the actual input image at this timestep
-        noisy_img = decode_latents_to_image(pipe, latents)
+        # Quick preview of noisy latent (no VAE decode to save memory)
+        noisy_img = latents_to_preview(latents, source_img.size)
         noisy_img.save(os.path.join(args.output_dir, f"input_step{step_idx}_{step_name}.jpg"))
 
         t_input = t.unsqueeze(0)
