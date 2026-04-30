@@ -161,10 +161,15 @@ def main():
     source_img.save(os.path.join(args.output_dir, "source.jpg"))
 
     all_layers = list(range(24))
-    # Select timesteps: early (step 1), early-mid (step 5), mid (step 9), late-mid (step 13), late (step 17)
     total_steps = len(timesteps)
     step_indices = [0, total_steps // 4, total_steps // 2, 3 * total_steps // 4, total_steps - 1]
     step_names = ["early", "early_mid", "mid", "late_mid", "late"]
+
+    def decode_latents_to_image(pipe, latents):
+        """Decode latents to PIL image for visualization."""
+        lat = latents / pipe.vae.config.scaling_factor + pipe.vae.config.shift_factor
+        img = pipe.vae.decode(lat, return_dict=False)[0]
+        return pipe.image_processor.postprocess(img, output_type="pil")[0]
 
     for si, (step_idx, step_name) in enumerate(zip(step_indices, step_names)):
         t = timesteps[step_idx]
@@ -174,6 +179,10 @@ def main():
         # Add noise at this timestep level
         noise = torch.randn_like(latents_clean)
         latents = pipe.scheduler.scale_noise(latents_clean, t.unsqueeze(0), noise)
+
+        # Decode the noisy latent to get the actual input image at this timestep
+        noisy_img = decode_latents_to_image(pipe, latents)
+        noisy_img.save(os.path.join(args.output_dir, f"input_step{step_idx}_{step_name}.jpg"))
 
         t_input = t.unsqueeze(0)
 
@@ -203,19 +212,19 @@ def main():
         diff_vmax = max(ds.max() for ds in all_diff_spatial)
 
         for li in range(24):
-            # Row 0: Cond attention
-            overlay = overlay_heatmap(source_img, all_cond_spatial[li], vmin=0, vmax=attn_vmax)
+            # Row 0: Cond attention overlaid on noisy input
+            overlay = overlay_heatmap(noisy_img, all_cond_spatial[li], vmin=0, vmax=attn_vmax)
             axes[0, li].imshow(overlay)
             axes[0, li].set_title(f"L{li}", fontsize=7)
             axes[0, li].axis('off')
 
-            # Row 1: Uncond attention
-            overlay = overlay_heatmap(source_img, all_uncond_spatial[li], vmin=0, vmax=attn_vmax)
+            # Row 1: Uncond attention overlaid on noisy input
+            overlay = overlay_heatmap(noisy_img, all_uncond_spatial[li], vmin=0, vmax=attn_vmax)
             axes[1, li].imshow(overlay)
             axes[1, li].axis('off')
 
-            # Row 2: |Cond - Uncond| (absolute difference)
-            overlay = overlay_heatmap(source_img, all_diff_spatial[li], vmin=0, vmax=diff_vmax)
+            # Row 2: |Cond - Uncond| overlaid on noisy input
+            overlay = overlay_heatmap(noisy_img, all_diff_spatial[li], vmin=0, vmax=diff_vmax)
             axes[2, li].imshow(overlay)
             axes[2, li].axis('off')
 
@@ -237,15 +246,15 @@ def main():
             us = all_uncond_spatial[li]
             ds = all_diff_spatial[li]
 
-            axes[0, col].imshow(overlay_heatmap(source_img, cs, vmin=0, vmax=attn_vmax))
+            axes[0, col].imshow(overlay_heatmap(noisy_img, cs, vmin=0, vmax=attn_vmax))
             axes[0, col].set_title(f"L{li} Cond", fontsize=9)
             axes[0, col].axis('off')
 
-            axes[1, col].imshow(overlay_heatmap(source_img, us, vmin=0, vmax=attn_vmax))
+            axes[1, col].imshow(overlay_heatmap(noisy_img, us, vmin=0, vmax=attn_vmax))
             axes[1, col].set_title(f"L{li} Uncond", fontsize=9)
             axes[1, col].axis('off')
 
-            axes[2, col].imshow(overlay_heatmap(source_img, ds, vmin=0, vmax=diff_vmax))
+            axes[2, col].imshow(overlay_heatmap(noisy_img, ds, vmin=0, vmax=diff_vmax))
             axes[2, col].set_title(f"L{li} |Diff|", fontsize=9)
             axes[2, col].axis('off')
 
