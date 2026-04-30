@@ -181,7 +181,7 @@ def main():
     }
 
     layer_subsets = gen_helpful if args.task == "gen" else edit_helpful
-    coarse_scales = [1.5, 2.0, 3.0, 5.0, 7.0, 10.0]
+    coarse_scales = [-2.0, -1.0, -0.5, 0.0, 0.5, 0.8, 1.2, 1.5, 2.0, 3.0, 5.0, 7.0]
 
     all_results = []
     best_clip = 0
@@ -281,8 +281,8 @@ def main():
 
     for layer_idx in best_config['layers']:
         original_scale = current_scales[layer_idx]
-        test_scales = [original_scale * f for f in [0.3, 0.5, 0.7, 1.5, 2.0, 3.0]]
-        test_scales = sorted(set([round(s, 2) for s in test_scales if s > 1.0]))
+        test_scales = [original_scale * f for f in [-2.0, -1.0, -0.5, 0.0, 0.3, 0.5, 0.7, 1.5, 2.0, 3.0]]
+        test_scales = sorted(set([round(s, 2) for s in test_scales if s != 1.0]))
 
         layer_best = original_scale
         layer_best_clip = current_clip
